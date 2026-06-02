@@ -40,6 +40,7 @@ class ClusterResult(TypedDict):
     latest_ts_utc: str
     age_min: float
     raw_category: str
+    link: str
 
 
 class NewsClusterDisplay(TypedDict):
@@ -49,6 +50,7 @@ class NewsClusterDisplay(TypedDict):
     direction: dict[str, str]   # asset → "+", "-", "0"
     magnitude: float
     age_min: float
+    link: str
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +214,7 @@ def cluster_events(
         title = hl.get("title") or ""
         raw_cat = hl.get("raw_category") or ""
 
+        link = hl.get("link") or ""
         merged = False
         for c in clusters:
             # (a) time window check
@@ -226,6 +229,7 @@ def cluster_events(
                 if ts > c["latest_ts"]:
                     c["latest_ts"] = ts
                     c["repr_title"] = title  # perbaharui representatif
+                    c["link"] = link
                 merged = True
                 break
 
@@ -235,6 +239,7 @@ def cluster_events(
                 "latest_ts": ts,
                 "n": 1,
                 "raw_category": raw_cat,
+                "link": link,
             })
 
     results: list[ClusterResult] = []
@@ -247,6 +252,7 @@ def cluster_events(
             latest_ts_utc=c["latest_ts"].strftime("%Y-%m-%dT%H:%M:%SZ"),
             age_min=round(age_min, 1),
             raw_category=c["raw_category"],
+            link=c.get("link", ""),
         ))
 
     # Urutkan terbaru dulu
@@ -518,6 +524,7 @@ def compute_news_delta(
             direction=direction_display,
             magnitude=round(mag, 3),
             age_min=cluster["age_min"],
+            link=cluster.get("link", ""),
         ))
 
     # --- 3. Scale ke ±100 range (delta dalam satuan raw score × weight,
