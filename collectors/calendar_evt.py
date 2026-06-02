@@ -103,6 +103,9 @@ _FAIRECONOMY_THIS_WEEK_URL: str = (
 _FAIRECONOMY_NEXT_WEEK_URL: str = (
     "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
 )
+_FAIRECONOMY_LAST_WEEK_URL: str = (
+    "https://nfs.faireconomy.media/ff_calendar_lastweek.json"
+)
 
 _MYFXBOOK_CALENDAR_URL: str = (
     "https://www.myfxbook.com/api/get-economic-calendar.json"
@@ -132,8 +135,8 @@ _RELEVANT_CURRENCIES: set[str] = {
 }
 
 # Window fetch: acuan ±jam dari sekarang
-_WINDOW_PAST_HOURS: int = 24   # event sudah rilis (hari ini)
-_WINDOW_FUTURE_HOURS: int = 48  # event akan datang
+_WINDOW_PAST_HOURS: int = 24 * 14   # 2 minggu ke belakang (historis dgn aktual)
+_WINDOW_FUTURE_HOURS: int = 24 * 8  # ~1 minggu ke depan
 
 
 # ---------------------------------------------------------------------------
@@ -329,14 +332,15 @@ def _fetch_faireconomy(
     all_raw: list[dict] = []
     errors: list[str] = []
 
-    for url in [_FAIRECONOMY_THIS_WEEK_URL, _FAIRECONOMY_NEXT_WEEK_URL]:
+    # lastweek dulu (historis), lalu thisweek, lalu nextweek. Toleran kalau 404.
+    for url in [_FAIRECONOMY_LAST_WEEK_URL, _FAIRECONOMY_THIS_WEEK_URL, _FAIRECONOMY_NEXT_WEEK_URL]:
         try:
             raw = _fetch_faireconomy_week(url)
             all_raw.extend(raw)
-            logger.debug("faireconomy %s: %d raw events", url.split("/")[-1], len(raw))
+            logger.info("faireconomy %s: %d raw events", url.split("/")[-1], len(raw))
         except Exception as exc:
             errors.append(f"{url.split('/')[-1]}: {exc}")
-            logger.warning("faireconomy fetch gagal untuk %s: %s", url, exc)
+            logger.warning("faireconomy fetch gagal untuk %s: %s (lanjut endpoint lain)", url, exc)
 
     if not all_raw and errors:
         raise RuntimeError(f"faireconomy: semua endpoint gagal — {'; '.join(errors)}")
