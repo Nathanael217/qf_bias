@@ -461,17 +461,16 @@ def render_pair_scanner(
         st.warning("Data pair kosong — periksa engine/scoring.")
         return
 
-    col_sel, col_info = st.columns([2, 3])
+    all_assets = list(ASSETS_FX) + [ASSET_GOLD] + list(ASSETS_CRYPTO)
+    col_b, col_q = st.columns(2)
+    with col_b:
+        sel_base = st.selectbox("Base Currency", options=all_assets, index=0, key="ps_base")
+    with col_q:
+        sel_quote = st.selectbox("Quote Currency", options=all_assets, index=1, key="ps_quote")
 
-    with col_sel:
-        all_assets = list(ASSETS_FX) + [ASSET_GOLD] + list(ASSETS_CRYPTO)
-        base_default = 0   # EUR
-        quote_default = 1  # USD
-
-        sel_base = st.selectbox("Base Currency", options=all_assets, index=base_default, key="ps_base")
-        sel_quote = st.selectbox("Quote Currency", options=all_assets, index=quote_default, key="ps_quote")
-
-    with col_info:
+    # Panel info dirender SETELAH kedua selectbox terbaca (hindari stale value).
+    info_box = st.container()
+    with info_box:
         if sel_base == sel_quote:
             st.warning("Base dan quote tidak boleh sama.")
         else:
@@ -661,87 +660,125 @@ def render_news_feed(news_clusters: list[dict]) -> None:
 # ===========================================================================
 
 def render_key_risk_events(calendar_data: dict) -> None:
-    """Render upcoming events dengan countdown WIB."""
+    """Render risk events: filter impact + currency, upcoming + released (dgn aktual)."""
 
-    st.subheader("⏰ Key Risk Events (Akan Datang)")
+    st.subheader("⏰ Key Risk Events")
 
     events = calendar_data.get("events", [])
     if calendar_data.get("_error") and not events:
         st.warning(f"Calendar fetch gagal: {calendar_data['_error']}")
         return
-
-    upcoming = [e for e in events if e.get("status") == "upcoming"]
-    upcoming_sorted = sorted(upcoming, key=lambda e: e.get("ts_utc", ""))
-
-    if not upcoming_sorted:
-        st.info("Tidak ada event upcoming dalam 48 jam ke depan.")
+    if not events:
+        st.info("Tidak ada event dalam window.")
         return
 
-    for ev in upcoming_sorted:
+    # ---- FILTER BAR ----
+    fcol1, fcol2, fcol3 = st.columns([2, 2, 1.5])
+    with fcol1:
+        impact_filter = st.multiselect(
+            "Filter Impact", options=["HIGH", "MED", "LOW"],
+            default=["HIGH", "MED"], key="re_impact",
+        )
+    with fcol2:
+        # Currency yang muncul di event
+        avail_ccy = sorted({e.get("currency", "?") for e in events if e.get("currency")})
+        ccy_filter = st.multiselect(
+            "Filter Currency/Pair", options=avail_ccy, default=[],
+            key="re_ccy", help="Kosong = semua. Pilih currency utk fokus pair tertentu.",
+        )
+    with fcol3:
+        show_released = st.toggle("Tampilkan yg sudah lewat", value=False, key="re_released")
+
+    def _match(ev: dict) -> bool:
+        if impact_filter and ev.get("impact", "LOW") not in impact_filter:
+            return False
+        if ccy_filter and ev.get("currency") not in ccy_filter:
+            return False
+        return True
+
+    filtered = [e for e in events if _match(e)]
+    upcoming = sorted([e for e in filtered if e.get("status") == "upcoming"],
+                      key=lambda e: e.get("ts_utc", ""))
+    released = sorted([e for e in filtered if e.get("status") == "released"],
+                      key=lambda e: e.get("ts_utc", ""), reverse=True)
+
+    def _render_row(ev: dict, is_released: bool) -> None:
         try:
-            ts_utc_str = ev.get("ts_utc", "")
             ts_wib_str = ev.get("ts_wib", "")
             currency = ev.get("currency", "–")
             impact = ev.get("impact", "LOW")
             name = ev.get("name", "–")
             forecast = ev.get("forecast")
             previous = ev.get("previous")
+            actual = ev.get("actual")
+            ts_utc_str = ev.get("ts_utc", "")
 
-            mins = minutes_until(ts_utc_str) if ts_utc_str else None
-            countdown = countdown_str(ts_utc_str) if ts_utc_str else "–"
-
-            # Warna countdown berdasarkan waktu
-            if mins is not None and mins <= 15:
-                cd_color = "#ef4444"   # merah — sangat dekat
-            elif mins is not None and mins <= 60:
-                cd_color = "#d97706"  # kuning
-            else:
+            if is_released:
                 cd_color = "#6b7280"
+                countdown = "selesai"
+            else:
+                mins = minutes_until(ts_utc_str) if ts_utc_str else None
+                countdown = countdown_str(ts_utc_str) if ts_utc_str else "–"
+                if mins is not None and mins <= 15:
+                    cd_color = "#ef4444"
+                elif mins is not None and mins <= 60:
+                    cd_color = "#d97706"
+                else:
+                    cd_color = "#6b7280"
 
-            col_time, col_impact, col_currency, col_name, col_data = st.columns([2, 1, 1, 3, 2.5])
-
+            col_time, col_impact, col_ccy, col_name, col_data = st.columns([2, 1, 1, 3, 2.5])
             with col_time:
                 st.markdown(
                     f"<div style='font-weight:700;color:{cd_color};font-size:0.85rem;'>{countdown}</div>"
                     f"<div style='font-size:0.72rem;color:#9ca3af;'>{ts_wib_str} WIB</div>",
-                    unsafe_allow_html=True,
-                )
-
+                    unsafe_allow_html=True)
             with col_impact:
                 st.markdown(_impact_badge(impact), unsafe_allow_html=True)
-
-            with col_currency:
-                st.markdown(
-                    f"<span style='font-weight:700;font-size:0.85rem;'>{currency}</span>",
-                    unsafe_allow_html=True,
-                )
-
+            with col_ccy:
+                st.markdown(f"<span style='font-weight:700;font-size:0.85rem;'>{currency}</span>",
+                            unsafe_allow_html=True)
             with col_name:
-                st.markdown(
-                    f"<div style='font-size:0.87rem;font-weight:600;'>{name}</div>",
-                    unsafe_allow_html=True,
-                )
-
+                st.markdown(f"<div style='font-size:0.87rem;font-weight:600;'>{name}</div>",
+                            unsafe_allow_html=True)
             with col_data:
                 parts = []
+                # Untuk event lewat: tampilkan AKTUAL + surprise vs forecast
+                if is_released and actual is not None:
+                    a_color = "#9ca3af"
+                    if forecast is not None:
+                        try:
+                            a_color = "#16a34a" if float(actual) >= float(forecast) else "#ef4444"
+                        except (TypeError, ValueError):
+                            pass
+                    parts.append(f"A: <b style='color:{a_color};'>{actual}</b>")
                 if forecast is not None:
-                    parts.append(f"F: <b>{forecast}</b>")
+                    parts.append(f"F: {forecast}")
                 if previous is not None:
                     parts.append(f"P: {previous}")
                 data_str = " &nbsp; ".join(parts) if parts else "–"
-                st.markdown(
-                    f"<div style='font-size:0.78rem;color:#374151;'>{data_str}</div>",
-                    unsafe_allow_html=True,
-                )
-
-            st.markdown(
-                "<hr style='border:none;border-top:1px solid #f3f4f6;margin:3px 0;'>",
-                unsafe_allow_html=True,
-            )
-
+                st.markdown(f"<div style='font-size:0.78rem;color:#9ca3af;'>{data_str}</div>",
+                            unsafe_allow_html=True)
+            st.markdown("<hr style='border:none;border-top:1px solid #f3f4f6;margin:3px 0;'>",
+                        unsafe_allow_html=True)
         except Exception as exc:
             st.caption(f"⚠ Gagal render event: {exc}")
-            continue
+
+    # ---- UPCOMING ----
+    st.markdown(f"**🔜 Akan Datang ({len(upcoming)})**")
+    if upcoming:
+        for ev in upcoming:
+            _render_row(ev, is_released=False)
+    else:
+        st.info("Tidak ada upcoming event sesuai filter.")
+
+    # ---- RELEASED (opsional) ----
+    if show_released:
+        st.markdown(f"**✅ Sudah Lewat ({len(released)}) — dengan hasil aktual**")
+        if released:
+            for ev in released:
+                _render_row(ev, is_released=True)
+        else:
+            st.info("Tidak ada event lewat sesuai filter.")
 
 
 # ===========================================================================
