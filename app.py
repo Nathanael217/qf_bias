@@ -322,6 +322,8 @@ def render_header(sources_status: dict[str, Any]) -> None:
     if sources_status:
         badge_parts = []
         for src, status in sources_status.items():
+            if src.startswith("_"):   # _cot_note dll → bukan badge
+                continue
             if status == "ok":
                 badge_parts.append(f'<span class="badge-ok">✓ {src}</span>')
             elif status == "warn":
@@ -334,6 +336,9 @@ def render_header(sources_status: dict[str, Any]) -> None:
             + "</div>",
             unsafe_allow_html=True,
         )
+        cot_note = sources_status.get("_cot_note")
+        if cot_note:
+            st.caption(f"ℹ️ {cot_note}")
 
     st.divider()
 
@@ -730,9 +735,10 @@ def render_key_risk_events(calendar_data: dict) -> None:
         except Exception:
             return None
 
-    # ---- MODE PICKER ----
+    # ---- MODE PICKER: Last / This / Upcoming Week ----
     mode = st.radio(
-        "Tampilan", options=["📅 Hari Ini (07:00 WIB)", "🗓️ Minggu Ini", "🕓 Historis (2 mgg)"],
+        "Tampilan",
+        options=["📅 Hari Ini", "⬅️ Minggu Lalu", "🗓️ Minggu Ini", "➡️ Minggu Depan"],
         horizontal=True, key="re_mode", label_visibility="collapsed",
     )
 
@@ -750,16 +756,6 @@ def render_key_risk_events(calendar_data: dict) -> None:
             help="Kosong = semua.",
         )
 
-    # ---- Filter hari (hanya untuk Minggu Ini) ----
-    day_filter = None
-    if mode == "🗓️ Minggu Ini":
-        day_names = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
-        day_choice = st.selectbox(
-            "Hari", options=["(Semua hari)"] + day_names, index=0, key="re_day",
-        )
-        if day_choice != "(Semua hari)":
-            day_filter = day_names.index(day_choice)  # 0=Senin
-
     def _base_match(ev: dict) -> bool:
         if impact_filter and ev.get("impact", "LOW") not in impact_filter:
             return False
@@ -771,24 +767,48 @@ def render_key_risk_events(calendar_data: dict) -> None:
         ew = _ev_wib(ev)
         return ew is not None and w_start <= ew < w_end
 
-    # ---- Pilih subset sesuai mode ----
-    if mode == "📅 Hari Ini (07:00 WIB)":
-        subset = [e for e in events if _base_match(e) and _in_window(e, today_start, today_end)]
-        st.caption(f"Window: {today_start.strftime('%a %d %b %H:%M')} → "
+    # Tentukan window minggu sesuai mode
+    last_monday = monday - timedelta(days=7)
+    next_monday = monday + timedelta(days=7)
+    next_sunday_end = next_monday + timedelta(days=7)
+
+    day_names = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+    day_filter = None
+    w_start = w_end = None
+    label = ""
+
+    if mode == "📅 Hari Ini":
+        w_start, w_end = today_start, today_end
+        st.caption(f"Window 07:00 WIB cycle: {today_start.strftime('%a %d %b %H:%M')} → "
                    f"{today_end.strftime('%a %d %b %H:%M')} WIB")
-    elif mode == "🗓️ Minggu Ini":
-        subset = [e for e in events if _base_match(e) and _in_window(e, monday, sunday_end)]
-        if day_filter is not None:
-            day_start = monday + timedelta(days=day_filter)
-            day_end = day_start + timedelta(days=1)
-            subset = [e for e in subset if _in_window(e, day_start, day_end)]
-        st.caption(f"Minggu: {monday.strftime('%d %b')} → {(sunday_end-timedelta(days=1)).strftime('%d %b')} WIB"
-                   + (f" · {day_names[day_filter]}" if day_filter is not None else ""))
-    else:  # Historis 2 minggu
-        hist_start = (now_w - timedelta(days=14)).replace(hour=0, minute=0, second=0, microsecond=0)
-        subset = [e for e in events if _base_match(e) and _in_window(e, hist_start, now_w)]
-        st.caption(f"Historis: {hist_start.strftime('%d %b')} → {now_w.strftime('%d %b %H:%M')} WIB "
-                   f"(hasil aktual; cakupan tergantung data faireconomy)")
+    else:
+        # Minggu Lalu / Ini / Depan → ada filter hari
+        if mode == "⬅️ Minggu Lalu":
+            w_start, w_end = last_monday, monday
+        elif mode == "🗓️ Minggu Ini":
+            w_start, w_end = monday, sunday_end
+        else:  # Minggu Depan
+            w_start, w_end = next_monday, next_sunday_end
+        day_choice = st.selectbox("Hari", options=["(Semua hari)"] + day_names, index=0, key="re_day")
+        if day_choice != "(Semua hari)":
+            day_filter = day_names.index(day_choice)
+        rng = f"{w_start.strftime('%d %b')} → {(w_end-timedelta(days=1)).strftime('%d %b')} WIB"
+        st.caption(rng + (f" · {day_names[day_filter]}" if day_filter is not None else ""))
+
+    subset = [e for e in events if _base_match(e) and _in_window(e, w_start, w_end)]
+    if day_filter is not None:
+        d_start = w_start + timedelta(days=day_filter)
+        d_end = d_start + timedelta(days=1)
+        subset = [e for e in subset if _in_window(e, d_start, d_end)]
+
+    # Diagnostik jujur: kalau total events ada tapi subset kosong → jelaskan
+    if not subset and events:
+        st.warning(
+            f"⚠ Ada {len(events)} event ter-fetch, tapi 0 di window ini. "
+            f"Kemungkinan: (a) faireconomy hanya menyediakan minggu berjalan "
+            f"(lastweek/nextweek sering 404), atau (b) semua ter-filter impact/currency. "
+            f"Coba mode 'Minggu Ini' + longgarkan filter."
+        )
 
     upcoming = sorted([e for e in subset if e.get("status") == "upcoming"], key=lambda e: e.get("ts_utc", ""))
     released = sorted([e for e in subset if e.get("status") == "released"], key=lambda e: e.get("ts_utc", ""), reverse=True)
@@ -1017,14 +1037,20 @@ def build_sources_status(
     else:
         status["FRED"] = "ok"
 
-    # COT
+    # COT — hijau kalau mayoritas aset dapat data; XAU missing itu normal (gold ada di
+    # laporan Disaggregated, bukan TFF), jadi BUKAN alasan kuning.
     cot_meta = cot.get("_meta", {})
-    if cot.get("_error") or cot_meta.get("stale"):
-        status["COT"] = "warn"  # warn, bukan fail — freshness handle
-    elif not cot.get("cot"):
-        status["COT"] = "fail"
+    cot_data = cot.get("cot", {})
+    n_valid = sum(1 for v in cot_data.values() if v.get("net") is not None)
+    if n_valid == 0:
+        status["COT"] = "fail"          # benar-benar kosong
+    elif cot_meta.get("stale") and n_valid < 3:
+        status["COT"] = "warn"          # sedikit data + stale
     else:
-        status["COT"] = "ok"
+        status["COT"] = "ok"            # ada data → hijau
+        xau = cot_data.get("XAU", {})
+        if xau.get("net") is None:
+            status["_cot_note"] = "XAU N/A (gold ada di laporan Disaggregated, bukan TFF — wajar, tidak mempengaruhi 9 aset lain)"
 
     # Retail
     retail_ok = retail.get("sources_ok", [])
