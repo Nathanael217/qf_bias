@@ -151,7 +151,7 @@ def score_R_hard(macro: dict[str, Any], asset: str) -> tuple[float, str]:
             if evt.get("z") is not None:
                 latest = evt
                 break
-        if latest:
+        if latest and latest.get("z") is not None:
             z_raw = float(latest["z"])
             z_clamped = _clamp(z_raw, -_RHARD_Z_CLAMP, _RHARD_Z_CLAMP)
             z_norm = z_clamped / _RHARD_Z_CLAMP
@@ -175,6 +175,8 @@ def score_R_hard(macro: dict[str, Any], asset: str) -> tuple[float, str]:
     for pair_sym, diff_val in rate_diff_map.items():
         # pair_sym = 6 karakter, misal "EURUSD"
         if len(pair_sym) != 6:
+            continue
+        if diff_val is None:          # FRED rate hilang → skip (jangan crash += None)
             continue
         base_sym = pair_sym[:3]
         quote_sym = pair_sym[3:]
@@ -479,9 +481,16 @@ def compute_asset_bias(
     }
     price_key = _ASSET_TO_PRICE_KEY.get(asset, "")
     px_data: dict = _safe_get(prices, "prices", price_key, default={})
-    last_price = float(px_data.get("last", 0.0))
-    chg_pct = float(px_data.get("chg_pct", 0.0))
-    atr14 = float(px_data.get("atr14", 0.0))
+    # .get(k, default) mengembalikan None kalau value EKSPLISIT None (bukan default).
+    # Guard: None / non-numeric → 0.0 (jangan crash float(None)).
+    def _num(v: Any, d: float = 0.0) -> float:
+        try:
+            return float(v) if v is not None else d
+        except (TypeError, ValueError):
+            return d
+    last_price = _num(px_data.get("last"))
+    chg_pct = _num(px_data.get("chg_pct"))
+    atr14 = _num(px_data.get("atr14"))
 
     # Price change absolut (proxy: chg_pct/100 × last)
     price_change_abs = abs(chg_pct / 100.0 * last_price) if last_price > 0 else 0.0
