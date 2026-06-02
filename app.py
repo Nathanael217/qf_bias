@@ -586,7 +586,13 @@ def render_pair_scanner(
 def render_news_feed(news_clusters: list[dict]) -> None:
     """Render news clusters (sudah dedup) dari engine/news_overlay."""
 
-    st.subheader("📰 News Feed (Sudah Keluar)")
+    hcol, rcol = st.columns([5, 1])
+    with hcol:
+        st.subheader("📰 News Feed (Sudah Keluar)")
+    with rcol:
+        if st.button("🔄 Refresh", key="refresh_news", help="Muat ulang berita terbaru", use_container_width=True):
+            clear_all_caches()
+            st.rerun()
 
     if not news_clusters:
         st.info("Tidak ada news cluster saat ini — feed kosong atau semua event sudah decay.")
@@ -683,9 +689,18 @@ def render_news_feed(news_clusters: list[dict]) -> None:
 # ===========================================================================
 
 def render_key_risk_events(calendar_data: dict) -> None:
-    """Render risk events: filter impact + currency, upcoming + released (dgn aktual)."""
+    """Risk events 3 mode: Hari Ini (07:00 WIB cycle), Minggu Ini (Sen-Min + filter hari),
+    Historis (2 minggu ke belakang dgn aktual). + tombol refresh lokal."""
 
-    st.subheader("⏰ Key Risk Events")
+    from datetime import timedelta
+
+    hcol, rcol = st.columns([5, 1])
+    with hcol:
+        st.subheader("⏰ Key Risk Events")
+    with rcol:
+        if st.button("🔄 Refresh", key="refresh_risk", help="Muat ulang kalendar", use_container_width=True):
+            clear_all_caches()
+            st.rerun()
 
     events = calendar_data.get("events", [])
     if calendar_data.get("_error") and not events:
@@ -695,35 +710,88 @@ def render_key_risk_events(calendar_data: dict) -> None:
         st.info("Tidak ada event dalam window.")
         return
 
-    # ---- FILTER BAR ----
-    fcol1, fcol2, fcol3 = st.columns([2, 2, 1.5])
+    now_w = now_wib()
+
+    # --- Window "Hari Ini" = 07:00 WIB hari ini → 07:00 WIB besok ---
+    today_anchor = now_w.replace(hour=7, minute=0, second=0, microsecond=0)
+    if now_w.hour < 7:
+        today_anchor = today_anchor - timedelta(days=1)  # belum jam 7 → cycle kemarin
+    today_start = today_anchor
+    today_end = today_anchor + timedelta(days=1)
+
+    # --- Window "Minggu Ini" = Senin 00:00 → Minggu 23:59 WIB ---
+    monday = (now_w - timedelta(days=now_w.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    sunday_end = monday + timedelta(days=7)
+
+    def _ev_wib(ev: dict):
+        ts = ev.get("ts_utc", "")
+        try:
+            return parse_iso_utc(ts).astimezone(now_w.tzinfo)
+        except Exception:
+            return None
+
+    # ---- MODE PICKER ----
+    mode = st.radio(
+        "Tampilan", options=["📅 Hari Ini (07:00 WIB)", "🗓️ Minggu Ini", "🕓 Historis (2 mgg)"],
+        horizontal=True, key="re_mode", label_visibility="collapsed",
+    )
+
+    # ---- FILTER BAR (impact + currency selalu ada) ----
+    fcol1, fcol2 = st.columns(2)
     with fcol1:
         impact_filter = st.multiselect(
             "Filter Impact", options=["HIGH", "MED", "LOW"],
             default=["HIGH", "MED"], key="re_impact",
         )
     with fcol2:
-        # Currency yang muncul di event
         avail_ccy = sorted({e.get("currency", "?") for e in events if e.get("currency")})
         ccy_filter = st.multiselect(
-            "Filter Currency/Pair", options=avail_ccy, default=[],
-            key="re_ccy", help="Kosong = semua. Pilih currency utk fokus pair tertentu.",
+            "Filter Currency", options=avail_ccy, default=[], key="re_ccy",
+            help="Kosong = semua.",
         )
-    with fcol3:
-        show_released = st.toggle("Tampilkan yg sudah lewat", value=False, key="re_released")
 
-    def _match(ev: dict) -> bool:
+    # ---- Filter hari (hanya untuk Minggu Ini) ----
+    day_filter = None
+    if mode == "🗓️ Minggu Ini":
+        day_names = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+        day_choice = st.selectbox(
+            "Hari", options=["(Semua hari)"] + day_names, index=0, key="re_day",
+        )
+        if day_choice != "(Semua hari)":
+            day_filter = day_names.index(day_choice)  # 0=Senin
+
+    def _base_match(ev: dict) -> bool:
         if impact_filter and ev.get("impact", "LOW") not in impact_filter:
             return False
         if ccy_filter and ev.get("currency") not in ccy_filter:
             return False
         return True
 
-    filtered = [e for e in events if _match(e)]
-    upcoming = sorted([e for e in filtered if e.get("status") == "upcoming"],
-                      key=lambda e: e.get("ts_utc", ""))
-    released = sorted([e for e in filtered if e.get("status") == "released"],
-                      key=lambda e: e.get("ts_utc", ""), reverse=True)
+    def _in_window(ev: dict, w_start, w_end) -> bool:
+        ew = _ev_wib(ev)
+        return ew is not None and w_start <= ew < w_end
+
+    # ---- Pilih subset sesuai mode ----
+    if mode == "📅 Hari Ini (07:00 WIB)":
+        subset = [e for e in events if _base_match(e) and _in_window(e, today_start, today_end)]
+        st.caption(f"Window: {today_start.strftime('%a %d %b %H:%M')} → "
+                   f"{today_end.strftime('%a %d %b %H:%M')} WIB")
+    elif mode == "🗓️ Minggu Ini":
+        subset = [e for e in events if _base_match(e) and _in_window(e, monday, sunday_end)]
+        if day_filter is not None:
+            day_start = monday + timedelta(days=day_filter)
+            day_end = day_start + timedelta(days=1)
+            subset = [e for e in subset if _in_window(e, day_start, day_end)]
+        st.caption(f"Minggu: {monday.strftime('%d %b')} → {(sunday_end-timedelta(days=1)).strftime('%d %b')} WIB"
+                   + (f" · {day_names[day_filter]}" if day_filter is not None else ""))
+    else:  # Historis 2 minggu
+        hist_start = (now_w - timedelta(days=14)).replace(hour=0, minute=0, second=0, microsecond=0)
+        subset = [e for e in events if _base_match(e) and _in_window(e, hist_start, now_w)]
+        st.caption(f"Historis: {hist_start.strftime('%d %b')} → {now_w.strftime('%d %b %H:%M')} WIB "
+                   f"(hasil aktual; cakupan tergantung data faireconomy)")
+
+    upcoming = sorted([e for e in subset if e.get("status") == "upcoming"], key=lambda e: e.get("ts_utc", ""))
+    released = sorted([e for e in subset if e.get("status") == "released"], key=lambda e: e.get("ts_utc", ""), reverse=True)
 
     def _render_row(ev: dict, is_released: bool) -> None:
         try:
@@ -731,84 +799,60 @@ def render_key_risk_events(calendar_data: dict) -> None:
             currency = ev.get("currency", "–")
             impact = ev.get("impact", "LOW")
             name = ev.get("name", "–")
-            forecast = ev.get("forecast")
-            previous = ev.get("previous")
-            actual = ev.get("actual")
+            forecast = ev.get("forecast"); previous = ev.get("previous"); actual = ev.get("actual")
             ts_utc_str = ev.get("ts_utc", "")
 
             if is_released:
-                cd_color = "#6b7280"
-                countdown = "selesai"
+                cd_color = "#6b7280"; countdown = "selesai"
             else:
                 mins = minutes_until(ts_utc_str) if ts_utc_str else None
                 countdown = countdown_str(ts_utc_str) if ts_utc_str else "–"
-                if mins is not None and mins <= 15:
-                    cd_color = "#ef4444"
-                elif mins is not None and mins <= 60:
-                    cd_color = "#d97706"
-                else:
-                    cd_color = "#6b7280"
+                cd_color = "#ef4444" if (mins is not None and mins <= 15) else ("#d97706" if (mins is not None and mins <= 60) else "#6b7280")
 
             col_time, col_impact, col_ccy, col_name, col_a, col_f, col_p = st.columns([1.6, 0.9, 0.7, 2.4, 1.1, 1.1, 1.1])
             with col_time:
-                st.markdown(
-                    f"<div style='font-weight:700;color:{cd_color};font-size:0.85rem;'>{countdown}</div>"
-                    f"<div style='font-size:0.72rem;color:#9ca3af;'>{ts_wib_str} WIB</div>",
-                    unsafe_allow_html=True)
+                st.markdown(f"<div style='font-weight:700;color:{cd_color};font-size:0.85rem;'>{countdown}</div>"
+                            f"<div style='font-size:0.72rem;color:#9ca3af;'>{ts_wib_str} WIB</div>", unsafe_allow_html=True)
             with col_impact:
                 st.markdown(_impact_badge(impact), unsafe_allow_html=True)
             with col_ccy:
-                st.markdown(f"<span style='font-weight:700;font-size:0.85rem;'>{currency}</span>",
-                            unsafe_allow_html=True)
+                st.markdown(f"<span style='font-weight:700;font-size:0.85rem;'>{currency}</span>", unsafe_allow_html=True)
             with col_name:
-                st.markdown(f"<div style='font-size:0.87rem;font-weight:600;'>{name}</div>",
-                            unsafe_allow_html=True)
+                st.markdown(f"<div style='font-size:0.87rem;font-weight:600;'>{name}</div>", unsafe_allow_html=True)
 
-            # --- Helper: render satu angka besar berlabel ---
-            def _stat(label: str, val, color: str = "#e5e7eb"):
+            def _stat(label, val, color="#e5e7eb"):
                 shown = val if val is not None else "–"
-                return (f"<div style='text-align:center;'>"
-                        f"<div style='font-size:0.62rem;color:#6b7280;text-transform:uppercase;letter-spacing:0.04em;'>{label}</div>"
-                        f"<div style='font-size:1.15rem;font-weight:800;color:{color};line-height:1.2;'>{shown}</div>"
-                        f"</div>")
-
-            # ACTUAL — warna hijau/merah vs forecast (hanya kalau sudah rilis)
+                return (f"<div style='text-align:center;'><div style='font-size:0.62rem;color:#6b7280;"
+                        f"text-transform:uppercase;letter-spacing:0.04em;'>{label}</div>"
+                        f"<div style='font-size:1.15rem;font-weight:800;color:{color};line-height:1.2;'>{shown}</div></div>")
             a_color = "#9ca3af"
             if actual is not None and forecast is not None:
-                try:
-                    a_color = "#16a34a" if float(actual) >= float(forecast) else "#ef4444"
-                except (TypeError, ValueError):
-                    a_color = "#e5e7eb"
+                try: a_color = "#16a34a" if float(actual) >= float(forecast) else "#ef4444"
+                except (TypeError, ValueError): a_color = "#e5e7eb"
             elif actual is not None:
                 a_color = "#e5e7eb"
-            with col_a:
-                st.markdown(_stat("Actual", actual, a_color), unsafe_allow_html=True)
-            with col_f:
-                st.markdown(_stat("Forecast", forecast, "#93c5fd"), unsafe_allow_html=True)
-            with col_p:
-                st.markdown(_stat("Previous", previous, "#9ca3af"), unsafe_allow_html=True)
-
-            st.markdown("<hr style='border:none;border-top:1px solid #1f2937;margin:6px 0;'>",
-                        unsafe_allow_html=True)
+            with col_a: st.markdown(_stat("Actual", actual, a_color), unsafe_allow_html=True)
+            with col_f: st.markdown(_stat("Forecast", forecast, "#93c5fd"), unsafe_allow_html=True)
+            with col_p: st.markdown(_stat("Previous", previous, "#9ca3af"), unsafe_allow_html=True)
+            st.markdown("<hr style='border:none;border-top:1px solid #1f2937;margin:6px 0;'>", unsafe_allow_html=True)
         except Exception as exc:
             st.caption(f"⚠ Gagal render event: {exc}")
 
-    # ---- UPCOMING ----
-    st.markdown(f"**🔜 Akan Datang ({len(upcoming)})**")
-    if upcoming:
-        for ev in upcoming:
-            _render_row(ev, is_released=False)
-    else:
-        st.info("Tidak ada upcoming event sesuai filter.")
-
-    # ---- RELEASED (opsional) ----
-    if show_released:
-        st.markdown(f"**✅ Sudah Lewat ({len(released)}) — dengan hasil aktual**")
+    if mode == "🕓 Historis (2 mgg)":
+        st.markdown(f"**🕓 Sudah Lewat ({len(released)}) — dengan hasil aktual**")
         if released:
-            for ev in released:
-                _render_row(ev, is_released=True)
+            for ev in released: _render_row(ev, is_released=True)
         else:
-            st.info("Tidak ada event lewat sesuai filter.")
+            st.info("Tidak ada event historis sesuai filter (atau faireconomy tidak menyediakan).")
+    else:
+        st.markdown(f"**🔜 Akan Datang ({len(upcoming)})**")
+        if upcoming:
+            for ev in upcoming: _render_row(ev, is_released=False)
+        else:
+            st.info("Tidak ada upcoming event sesuai filter.")
+        if released:
+            with st.expander(f"✅ Sudah lewat dalam window ini ({len(released)}) — dengan aktual"):
+                for ev in released: _render_row(ev, is_released=True)
 
 
 def render_score_detail(
