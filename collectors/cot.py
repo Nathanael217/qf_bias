@@ -226,9 +226,10 @@ def _compute_cot_index(
     date_col: str,
 ) -> float | None:
     """COT Index = percentile net vs range 156-minggu. None kalau history <52 mgg."""
-    # Filter baris untuk asset ini
-    mask = history[_COL_NAME].apply(lambda n: _match_asset(n) == asset)
-    sub = history[mask].copy()
+    # Filter baris untuk asset ini (reset index dulu → cegah reindex error pada index non-unik)
+    h = history.reset_index(drop=True)
+    mask = h[_COL_NAME].apply(lambda n: _match_asset(n) == asset)
+    sub = h[mask].copy()
     if sub.empty:
         return None
 
@@ -306,7 +307,7 @@ def get_cot() -> dict[str, Any]:
             combined["_d"] = pd.to_datetime(combined[date_col], errors="coerce")
             combined = combined.sort_values("_d").drop_duplicates(
                 subset=[_COL_NAME, "_d"], keep="last"
-            )
+            ).reset_index(drop=True)   # FIX: index unik → cegah "Reindexing only valid with uniquely valued Index"
             result["_meta"]["weeks_history"] = int(combined["_d"].dropna().nunique())
         except Exception as exc:
             logger.warning("Gagal proses kolom tanggal: %s", exc)
@@ -329,7 +330,7 @@ def get_cot() -> dict[str, Any]:
 
         # Baris terbaru untuk asset ini
         amask = combined[_COL_NAME].apply(lambda n: _match_asset(n) == asset)
-        rows = combined[amask]
+        rows = combined[amask.values]   # .values → boolean array tanpa index alignment
         if rows.empty:
             slot["_error"] = "not_found_in_cftc"
             result["cot"][asset] = slot

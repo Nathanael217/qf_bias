@@ -152,7 +152,7 @@ def _get_json_with_retry(
 ) -> Any:
     """GET request, return parsed JSON. Raise RuntimeError setelah semua retry gagal."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; qf_bias-calendar/1.0)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, */*",
     }
     last_exc: Exception = RuntimeError("No attempts made")
