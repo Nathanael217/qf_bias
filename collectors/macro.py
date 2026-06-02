@@ -66,15 +66,31 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # (series_id, human_description)
+# Per currency: daftar KANDIDAT series_id (coba berurutan sampai ada yang berhasil).
+# ID OECD "IRSTCB01{cc}M156N" = immediate/overnight central bank rate (andal lintas negara).
+# CATATAN: RBATCTR/RBNZOCR/BOCR/SARON dari versi lama TERBUKTI 400 "series does not exist"
+# (dikonfirmasi via FRED API) → diganti. Yang gagal tetap graceful (null), tidak crash.
+_FRED_SERIES_CANDIDATES: dict[str, list[tuple[str, str]]] = {
+    "USD": [("DFEDTARU", "FOMC Fed Funds Upper Target"),
+            ("IRSTCB01USM156N", "OECD US overnight central bank rate")],
+    "EUR": [("ECBDFR", "ECB Deposit Facility Rate"),
+            ("IRSTCB01EZM156N", "OECD Euro area overnight rate")],
+    "GBP": [("IRSTCB01GBM156N", "OECD UK overnight central bank rate"),
+            ("BOERUKM", "BoE Official Bank Rate (legacy)")],
+    "JPY": [("IRSTCB01JPM156N", "OECD Japan overnight rate"),
+            ("IRSTCI01JPM156N", "Japan call money rate (legacy)")],
+    "AUD": [("IRSTCB01AUM156N", "OECD Australia overnight rate"),
+            ("IR3TIB01AUM156N", "Australia 3M interbank (proxy)")],
+    "NZD": [("IRSTCB01NZM156N", "OECD New Zealand overnight rate"),
+            ("IR3TIB01NZM156N", "NZ 3M interbank (proxy)")],
+    "CAD": [("IRSTCB01CAM156N", "OECD Canada overnight rate"),
+            ("IR3TIB01CAM156N", "Canada 3M interbank (proxy)")],
+    "CHF": [("IRSTCB01CHM156N", "OECD Switzerland overnight rate"),
+            ("IR3TIB01CHM156N", "Swiss 3M interbank (proxy)")],
+}
+# Kompat: tetap ekspos _FRED_SERIES (id utama) untuk kode lain yang mungkin refer.
 _FRED_SERIES: dict[str, tuple[str, str]] = {
-    "USD": ("DFEDTARU",          "FOMC Fed Funds Rate Upper Target"),
-    "EUR": ("ECBDFR",            "ECB Deposit Facility Rate"),
-    "GBP": ("BOERUKM",          "BoE Official Bank Rate"),
-    "JPY": ("IRSTCI01JPM156N",  "Japan Overnight Call Money Rate"),
-    "AUD": ("RBATCTR",          "RBA Cash Rate Target"),
-    "NZD": ("RBNZOCR",          "RBNZ Official Cash Rate"),
-    "CAD": ("BOCR",             "BoC Overnight Rate"),
-    "CHF": ("SARON",            "Swiss Average Rate ON (SNB proxy)"),
+    ccy: cands[0] for ccy, cands in _FRED_SERIES_CANDIDATES.items()
 }
 
 # Currencies with no policy rate (no FRED series)
@@ -348,14 +364,21 @@ def get_macro(
     fred_ok: list[str] = []
     fred_fail: list[str] = []
 
-    for currency, (series_id, _desc) in _FRED_SERIES.items():
-        val = _fetch_fred_latest(series_id, api_key, session)
+    for currency, candidates in _FRED_SERIES_CANDIDATES.items():
+        val = None
+        used_id = None
+        for series_id, _desc in candidates:
+            val = _fetch_fred_latest(series_id, api_key, session)
+            if val is not None:
+                used_id = series_id
+                break  # kandidat berhasil → stop
+            logger.warning("FRED %s untuk %s gagal/404 — coba kandidat berikutnya", series_id, currency)
         result["rates"][currency] = val
         if val is not None:
-            fred_ok.append(f"{currency}({series_id})")
+            fred_ok.append(f"{currency}({used_id})")
         else:
-            fred_fail.append(f"{currency}({series_id})")
-            logger.warning("Rate unavailable for %s via FRED %s", currency, series_id)
+            fred_fail.append(f"{currency}(semua kandidat gagal)")
+            logger.warning("Rate %s: SEMUA kandidat FRED gagal", currency)
 
     if fred_ok:
         result["_meta"]["sources_ok"].append(f"FRED:{','.join(fred_ok)}")
