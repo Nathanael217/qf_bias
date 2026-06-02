@@ -249,6 +249,7 @@ def get_news(max_headlines: int = _MAX_HEADLINES) -> dict:
 
         title = _clean_title(raw_title)
         raw_category = _extract_raw_category(entry)
+        link = getattr(entry, "link", "") or ""   # URL artikel (RSS link)
 
         headlines.append({
             "ts_utc": fmt_iso_utc(ts_utc),
@@ -256,6 +257,7 @@ def get_news(max_headlines: int = _MAX_HEADLINES) -> dict:
             "title": title,
             "source": _SOURCE_NAME,
             "raw_category": raw_category,  # None kalau tidak ada
+            "link": link,
         })
 
     # Urutkan descending by ts_utc (terbaru duluan)
