@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _CFTC_ANNUAL_TFF_URL = "https://www.cftc.gov/files/dea/history/fut_fin_txt_{year}.zip"
-_CFTC_WEEKLY_TFF_URL = "https://www.cftc.gov/files/dea/newcot/FinFutWk.txt"
+_CFTC_WEEKLY_TFF_URL = "https://www.cftc.gov/dea/newcot/FinFutWk.txt"  # path tanpa /files/
 
 _REQUEST_TIMEOUT = 25
 _RETRIES = 1
@@ -78,6 +78,8 @@ _MARKET_MATCH: dict[str, str] = {
     "CANADIAN DOLLAR - CHICAGO MERCANTILE":    "CAD",
     "SWISS FRANC - CHICAGO MERCANTILE":        "CHF",
     "GOLD - COMMODITY EXCHANGE":               "XAU",
+    "GOLD - COMMODITY EXCHANGE INC":           "XAU",
+    "GOLD - COMMODITY EXCHANGE, INC":          "XAU",
     "BITCOIN - CHICAGO MERCANTILE":            "BTC",
 }
 

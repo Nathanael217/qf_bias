@@ -71,23 +71,23 @@ logger = logging.getLogger(__name__)
 # CATATAN: RBATCTR/RBNZOCR/BOCR/SARON dari versi lama TERBUKTI 400 "series does not exist"
 # (dikonfirmasi via FRED API) → diganti. Yang gagal tetap graceful (null), tidak crash.
 _FRED_SERIES_CANDIDATES: dict[str, list[tuple[str, str]]] = {
-    "USD": [("DFEDTARU", "FOMC Fed Funds Upper Target"),
-            ("IRSTCB01USM156N", "OECD US overnight central bank rate")],
-    "EUR": [("ECBDFR", "ECB Deposit Facility Rate"),
-            ("IRSTCB01EZM156N", "OECD Euro area overnight rate")],
-    "GBP": [("IRSTCB01GBM156N", "OECD UK overnight central bank rate"),
-            ("BOERUKM", "BoE Official Bank Rate (legacy)")],
-    "JPY": [("IRSTCB01JPM156N", "OECD Japan overnight rate"),
-            ("IRSTCI01JPM156N", "Japan call money rate (legacy)")],
-    "AUD": [("IRSTCB01AUM156N", "OECD Australia overnight rate"),
-            ("IR3TIB01AUM156N", "Australia 3M interbank (proxy)")],
-    "NZD": [("IRSTCB01NZM156N", "OECD New Zealand overnight rate"),
-            ("IR3TIB01NZM156N", "NZ 3M interbank (proxy)")],
-    "CAD": [("IRSTCB01CAM156N", "OECD Canada overnight rate"),
-            ("IR3TIB01CAM156N", "Canada 3M interbank (proxy)")],
-    "CHF": [("IRSTCB01CHM156N", "OECD Switzerland overnight rate"),
-            ("IR3TIB01CHM156N", "Swiss 3M interbank (proxy)")],
+    # USD/EUR pakai policy rate resmi (terbukti jalan di log). Lainnya pakai
+    # IRSTCI01 (call money/immediate, OECD) — paling konsisten ada lintas negara.
+    "USD": [("DFEDTARU", "Fed Funds Upper Target")],
+    "EUR": [("ECBDFR", "ECB Deposit Facility")],
+    "GBP": [("IRSTCI01GBM156N", "UK call money OECD"),
+            ("IR3TIB01GBM156N", "UK 3M interbank OECD")],
+    "JPY": [("IRSTCI01JPM156N", "Japan call money OECD")],
+    "AUD": [("IRSTCI01AUM156N", "Australia call money OECD"),
+            ("IR3TIB01AUM156N", "Australia 3M interbank OECD")],
+    "NZD": [("IRSTCI01NZM156N", "NZ call money OECD"),
+            ("IR3TIB01NZM156N", "NZ 3M interbank OECD")],
+    "CAD": [("IRSTCI01CAM156N", "Canada call money OECD"),
+            ("IR3TIB01CAM156N", "Canada 3M interbank OECD")],
+    "CHF": [("IRSTCI01CHM156N", "Swiss call money OECD"),
+            ("IR3TIB01CHM156N", "Swiss 3M interbank OECD")],
 }
+
 # Kompat: tetap ekspos _FRED_SERIES (id utama) untuk kode lain yang mungkin refer.
 _FRED_SERIES: dict[str, tuple[str, str]] = {
     ccy: cands[0] for ccy, cands in _FRED_SERIES_CANDIDATES.items()
@@ -187,8 +187,14 @@ def _fetch_fred_latest(
         except requests.exceptions.Timeout:
             logger.warning("FRED %s timeout (attempt %d/%d)", series_id, attempt + 1, retries + 1)
         except requests.exceptions.HTTPError as exc:
+            code = getattr(exc.response, "status_code", None)
+            if code == 429:      # rate-limited → tunggu & retry
+                logger.warning("FRED %s 429 — tunggu 2s & retry", series_id)
+                time.sleep(2.0)
+                attempt += 1
+                continue
             logger.error("FRED %s HTTP error: %s", series_id, exc)
-            return None          # 4xx → no point retrying
+            return None          # 4xx lain → no retry
         except Exception as exc:
             logger.error("FRED %s unexpected error: %s", series_id, exc)
 
@@ -364,10 +370,12 @@ def get_macro(
     fred_ok: list[str] = []
     fred_fail: list[str] = []
 
+    import time as _t
     for currency, candidates in _FRED_SERIES_CANDIDATES.items():
         val = None
         used_id = None
         for series_id, _desc in candidates:
+            _t.sleep(0.6)   # jeda anti-429 (FRED throttle); total ~8 currency × 0.6s ≈ 5s
             val = _fetch_fred_latest(series_id, api_key, session)
             if val is not None:
                 used_id = series_id

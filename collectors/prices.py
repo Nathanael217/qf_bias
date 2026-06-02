@@ -54,8 +54,10 @@ _YF_TICKER_MAP: dict[str, str] = {
     "NZDUSD=X":   "NZDUSD",
     "USDCAD=X":   "USDCAD",
     "USDCHF=X":   "USDCHF",
-    "XAUUSD=X":   "XAUUSD",   # spot gold vs USD  (fallback: "GC=F" front-month futures)
+    "GC=F":       "XAUUSD",   # gold futures (XAUUSD=X sering delisted di Yahoo)
     "DX-Y.NYB":   "DXY",      # ICE US Dollar Index
+    "BTC-USD":    "BTCUSD",   # crypto via Yahoo (Bybit diblok CloudFront utk IP datacenter)
+    "ETH-USD":    "ETHUSD",
 }
 
 # ccxt Bybit symbol → qf_bias symbol
@@ -287,11 +289,9 @@ def get_prices() -> dict[str, Any]:
         df = yf_frames.get(yf_tk, pd.DataFrame())
         prices[qf_symbol] = _parse_yf_slot(df, qf_symbol)
 
-    # --- Bybit (crypto) -------------------------------------------------------
-    for bybit_sym, qf_symbol in _BYBIT_SYMBOL_MAP.items():
-        logger.info("Fetching Bybit OHLCV for %s (%s)", bybit_sym, qf_symbol)
-        ohlcv = _fetch_bybit_ohlcv(bybit_sym)
-        prices[qf_symbol] = _parse_bybit_slot(ohlcv, qf_symbol)
+    # --- Crypto: via yfinance (BTC-USD/ETH-USD) sudah termasuk di _YF_TICKER_MAP ---
+    # Bybit dilewati: CloudFront 403 untuk IP datacenter (Streamlit Cloud).
+    # Fungsi _fetch_bybit_ohlcv tetap ada untuk pemakaian lokal/VPS bila diperlukan.
 
     logger.info(
         "get_prices() done — %d symbols, %d OK",
