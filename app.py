@@ -615,14 +615,24 @@ def render_news_feed(news_clusters: list[dict]) -> None:
         # Reaksi aset yang non-zero
         reactions = {a: v for a, v in direction.items() if v != "0"}
 
+        link = cluster.get("link", "")
+
         with st.container():
-            col_event, col_meta, col_react = st.columns([4, 1.5, 2.5])
+            col_event, col_meta, col_react, col_act = st.columns([3.6, 1.4, 2.2, 1.4])
 
             with col_event:
-                st.markdown(
-                    f"<div style='font-weight:600;font-size:0.9rem;'>{event_title}</div>",
-                    unsafe_allow_html=True,
-                )
+                # Judul + link "Buka" kalau ada
+                if link:
+                    st.markdown(
+                        f"<div style='font-weight:600;font-size:0.9rem;'>{event_title} "
+                        f"<a href='{link}' target='_blank' style='font-size:0.72rem;color:#60a5fa;text-decoration:none;'>🔗 buka</a></div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f"<div style='font-weight:600;font-size:0.9rem;'>{event_title}</div>",
+                        unsafe_allow_html=True,
+                    )
 
             with col_meta:
                 st.markdown(
@@ -649,8 +659,21 @@ def render_news_feed(news_clusters: list[dict]) -> None:
                         unsafe_allow_html=True,
                     )
 
+            with col_act:
+                # Placeholder tombol Groq AI — aktif di sesi integrasi Groq berikutnya.
+                # Saat ini menampilkan tombol disabled + caption, supaya slot UI sudah siap.
+                st.button(
+                    "🤖 Groq context",
+                    key=f"groq_{abs(hash(event_title))%10**8}",
+                    disabled=True,
+                    help="Analisis konteks AI (Groq) — diaktifkan di update berikutnya. "
+                         "Akan menilai: kekuatan currency saat ini, dampak news ke trader, "
+                         "potensi sentimen, lalu memberi weighting terukur (engine yang hitung).",
+                    use_container_width=True,
+                )
+
             st.markdown(
-                "<hr style='border:none;border-top:1px solid #f3f4f6;margin:4px 0;'>",
+                "<hr style='border:none;border-top:1px solid #1f2937;margin:4px 0;'>",
                 unsafe_allow_html=True,
             )
 
@@ -726,7 +749,7 @@ def render_key_risk_events(calendar_data: dict) -> None:
                 else:
                     cd_color = "#6b7280"
 
-            col_time, col_impact, col_ccy, col_name, col_data = st.columns([2, 1, 1, 3, 2.5])
+            col_time, col_impact, col_ccy, col_name, col_a, col_f, col_p = st.columns([1.6, 0.9, 0.7, 2.4, 1.1, 1.1, 1.1])
             with col_time:
                 st.markdown(
                     f"<div style='font-weight:700;color:{cd_color};font-size:0.85rem;'>{countdown}</div>"
@@ -740,25 +763,32 @@ def render_key_risk_events(calendar_data: dict) -> None:
             with col_name:
                 st.markdown(f"<div style='font-size:0.87rem;font-weight:600;'>{name}</div>",
                             unsafe_allow_html=True)
-            with col_data:
-                parts = []
-                # Untuk event lewat: tampilkan AKTUAL + surprise vs forecast
-                if is_released and actual is not None:
-                    a_color = "#9ca3af"
-                    if forecast is not None:
-                        try:
-                            a_color = "#16a34a" if float(actual) >= float(forecast) else "#ef4444"
-                        except (TypeError, ValueError):
-                            pass
-                    parts.append(f"A: <b style='color:{a_color};'>{actual}</b>")
-                if forecast is not None:
-                    parts.append(f"F: {forecast}")
-                if previous is not None:
-                    parts.append(f"P: {previous}")
-                data_str = " &nbsp; ".join(parts) if parts else "–"
-                st.markdown(f"<div style='font-size:0.78rem;color:#9ca3af;'>{data_str}</div>",
-                            unsafe_allow_html=True)
-            st.markdown("<hr style='border:none;border-top:1px solid #f3f4f6;margin:3px 0;'>",
+
+            # --- Helper: render satu angka besar berlabel ---
+            def _stat(label: str, val, color: str = "#e5e7eb"):
+                shown = val if val is not None else "–"
+                return (f"<div style='text-align:center;'>"
+                        f"<div style='font-size:0.62rem;color:#6b7280;text-transform:uppercase;letter-spacing:0.04em;'>{label}</div>"
+                        f"<div style='font-size:1.15rem;font-weight:800;color:{color};line-height:1.2;'>{shown}</div>"
+                        f"</div>")
+
+            # ACTUAL — warna hijau/merah vs forecast (hanya kalau sudah rilis)
+            a_color = "#9ca3af"
+            if actual is not None and forecast is not None:
+                try:
+                    a_color = "#16a34a" if float(actual) >= float(forecast) else "#ef4444"
+                except (TypeError, ValueError):
+                    a_color = "#e5e7eb"
+            elif actual is not None:
+                a_color = "#e5e7eb"
+            with col_a:
+                st.markdown(_stat("Actual", actual, a_color), unsafe_allow_html=True)
+            with col_f:
+                st.markdown(_stat("Forecast", forecast, "#93c5fd"), unsafe_allow_html=True)
+            with col_p:
+                st.markdown(_stat("Previous", previous, "#9ca3af"), unsafe_allow_html=True)
+
+            st.markdown("<hr style='border:none;border-top:1px solid #1f2937;margin:6px 0;'>",
                         unsafe_allow_html=True)
         except Exception as exc:
             st.caption(f"⚠ Gagal render event: {exc}")
@@ -779,6 +809,116 @@ def render_key_risk_events(calendar_data: dict) -> None:
                 _render_row(ev, is_released=True)
         else:
             st.info("Tidak ada event lewat sesuai filter.")
+
+
+def render_score_detail(
+    asset_bias_map: dict[str, dict],
+    news_delta: dict[str, float],
+) -> None:
+    """Tab Detail Skor: breakdown lengkap perhitungan bias satu currency terpilih."""
+
+    st.subheader("🔬 Detail Perhitungan Skor")
+
+    if not asset_bias_map:
+        st.warning("Data skor kosong — periksa engine.")
+        return
+
+    assets = list(asset_bias_map.keys())
+    sel = st.selectbox("Pilih mata uang / aset", options=assets, index=0, key="detail_asset")
+    data = asset_bias_map.get(sel, {})
+    drivers = data.get("drivers", {})
+    baseline = data.get("bias_baseline", 0.0)
+    nd = news_delta.get(sel, 0.0)
+    overlaid = max(-100.0, min(100.0, baseline + nd))
+    conf = data.get("confidence")
+    freshness = data.get("freshness_cot")
+    active = data.get("active_factors", [])
+
+    # --- Ringkasan atas: angka besar ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(
+            f"<div style='font-size:0.7rem;color:#6b7280;text-transform:uppercase;'>Baseline</div>"
+            f"<div style='font-size:2rem;font-weight:800;color:{_bias_color(baseline)};'>"
+            f"{'+' if baseline>=0 else ''}{baseline:.1f}</div>"
+            f"{_label_html(bias_label(baseline))}",
+            unsafe_allow_html=True)
+    with c2:
+        st.markdown(
+            f"<div style='font-size:0.7rem;color:#6b7280;text-transform:uppercase;'>+ News Δ</div>"
+            f"<div style='font-size:2rem;font-weight:800;color:{_bias_color(nd)};'>"
+            f"{'+' if nd>=0 else ''}{nd:.1f}</div>"
+            f"<div style='font-size:0.72rem;color:#9ca3af;'>cap ±30</div>",
+            unsafe_allow_html=True)
+    with c3:
+        st.markdown(
+            f"<div style='font-size:0.7rem;color:#6b7280;text-transform:uppercase;'>= Skor Final</div>"
+            f"<div style='font-size:2rem;font-weight:800;color:{_bias_color(overlaid)};'>"
+            f"{'+' if overlaid>=0 else ''}{overlaid:.1f}</div>"
+            f"{_label_html(bias_label(overlaid))}",
+            unsafe_allow_html=True)
+
+    if conf is not None:
+        st.markdown(f"**Confidence:** {_conf_bar(conf)} &nbsp; "
+                    f"<span style='font-size:0.78rem;color:#9ca3af;'>(kesepakatan faktor aktif: "
+                    f"{', '.join(active) if active else 'tidak ada'})</span>",
+                    unsafe_allow_html=True)
+
+    st.markdown("<hr style='border:none;border-top:1px solid #1f2937;margin:10px 0;'>", unsafe_allow_html=True)
+
+    # --- Breakdown per faktor: score × weight efektif = kontribusi ---
+    st.markdown("**Kontribusi per Faktor** &nbsp; <span style='font-size:0.75rem;color:#9ca3af;'>"
+                "(baseline = Σ score×weight ÷ Σ weight aktif, lalu ×100)</span>", unsafe_allow_html=True)
+
+    rows = []
+    factor_names = {"R_hard": "R_hard (makro: rate diff + surprise)",
+                    "C": "C (COT positioning)",
+                    "D": "D (retail sentiment, kontrarian)"}
+    for fkey in ["R_hard", "C", "D"]:
+        info = drivers.get(fkey, {})
+        score = info.get("score", 0.0)
+        w_eff = info.get("weight", 0.0)
+        w_nom = info.get("weight_nominal", w_eff)
+        detail = info.get("detail", "")
+        contrib = score * w_eff
+        is_active = abs(score) > 1e-9 and w_eff > 0
+        rows.append({
+            "Faktor": factor_names.get(fkey, fkey),
+            "Score": f"{score:+.3f}",
+            "Weight efektif": f"{w_eff:.3f}" + (f" (nom {w_nom:.2f})" if abs(w_eff-w_nom)>1e-6 else ""),
+            "Kontribusi": f"{contrib:+.3f}",
+            "Status": "✅ aktif" if is_active else "⚪ gate/0",
+            "Penjelasan": detail,
+        })
+    import pandas as pd
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # --- Catatan freshness COT kalau relevan ---
+    if freshness is not None and "C" in drivers:
+        cnom = drivers["C"].get("weight_nominal", 0.25)
+        ceff = drivers["C"].get("weight", 0.0)
+        st.caption(
+            f"❄️ **Freshness COT = {freshness:.3f}** → bobot C disesuaikan: "
+            f"{cnom:.2f} × {freshness:.3f} = {ceff:.3f}. "
+            f"(COT makin lama sejak snapshot Selasa → bobotnya makin kecil, bukan skornya.)"
+        )
+
+    # --- Rumus eksplisit ---
+    with st.expander("📐 Rumus & cara baca"):
+        _rumus_lines = [
+            "- **Tiap faktor** menghasilkan *score* ∈ [−1, +1] (lihat kolom Penjelasan untuk asal angkanya).",
+            "- **Weight efektif**: R_hard & D pakai bobot nominal; **C dikali freshness COT**.",
+            "- **Kontribusi** = score × weight efektif.",
+            "- **Baseline** = (Σ kontribusi faktor aktif) ÷ (Σ weight faktor aktif) × 100. Renormalisasi ini bikin faktor yang ter-*gate* (score 0) tidak menyeret hasil.",
+            "- **Skor Final** = clamp(Baseline + News Δ, −100, +100).",
+            "- **Confidence** = seberapa sepakat arah antar faktor aktif (bukan klaim akurasi).",
+            "",
+            "⚠️ Semua bobot = **placeholder** sampai backtest. Ini alat confluence, bukan sinyal arah.",
+        ]
+        st.markdown("\n".join(_rumus_lines))
+        st.info("🤖 Penjelasan naratif via Groq AI akan ditambahkan di update berikutnya — "
+                "akan menerjemahkan breakdown ini ke bahasa biasa + konteks kekuatan currency saat itu. "
+                "(Groq mengukur/menjelaskan; angka tetap dari engine deterministik.)")
 
 
 # ===========================================================================
@@ -999,9 +1139,10 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # STEP 7 — Tabs display
     # -----------------------------------------------------------------------
-    tab_board, tab_pairs, tab_news, tab_events = st.tabs([
+    tab_board, tab_pairs, tab_detail, tab_news, tab_events = st.tabs([
         "📈 Bias Board",
         "🔍 Pair Scanner",
+        "🔬 Detail Skor",
         "📰 News Feed",
         "⏰ Risk Events",
     ])
@@ -1017,6 +1158,12 @@ def main() -> None:
             render_pair_scanner(pair_bias_map, asset_bias_map, show_overlay, news_delta_map)
         except Exception as exc:
             st.error(f"Pair Scanner error: {exc}")
+
+    with tab_detail:
+        try:
+            render_score_detail(asset_bias_map, news_delta_map)
+        except Exception as exc:
+            st.error(f"Detail Skor error: {exc}")
 
     with tab_news:
         try:
