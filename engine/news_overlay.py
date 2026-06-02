@@ -209,8 +209,8 @@ def cluster_events(
 
     for hl in sorted_hl:
         ts = _parse_ts(hl["ts_utc"])
-        title = hl.get("title", "")
-        raw_cat = hl.get("raw_category", "")
+        title = hl.get("title") or ""
+        raw_cat = hl.get("raw_category") or ""
 
         merged = False
         for c in clusters:
@@ -416,7 +416,7 @@ def magnitude(cluster: ClusterResult) -> float:
         headline_bonus = 0.00
 
     # Bonus kategori
-    cat = cluster.get("raw_category", "").upper()
+    cat = (cluster.get("raw_category") or "").upper()
     if cat in {"HIGH_IMPACT", "CENTRAL_BANK", "GEOPOLITICAL", "MONETARY_POLICY"}:
         cat_bonus = 0.20
     elif cat in {"MEDIUM", "ECONOMIC", "MACRO"}:
