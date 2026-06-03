@@ -294,23 +294,60 @@ def get_cot() -> dict[str, Any]:
         return result
 
     combined = pd.concat(frames, ignore_index=True)
-    if _COL_NAME not in combined.columns:
+
+    # === ANTI-REINDEX: konversi ke list-of-dicts SEGERA, lalu pakai Python murni ===
+    # Apapun keanehan DataFrame (index/kolom duplikat, kolom 2D), records aman.
+    # Kolom duplikat: ambil kemunculan PERTAMA tiap nama kolom.
+    seen_cols: dict[str, int] = {}
+    col_positions: list[tuple[str, int]] = []
+    for pos, cname in enumerate(combined.columns):
+        if cname not in seen_cols:
+            seen_cols[cname] = pos
+            col_positions.append((cname, pos))
+    # Bangun records via posisi (iloc) → tidak tersentuh masalah index/nama duplikat.
+    values = combined.to_numpy()
+    records: list[dict] = []
+    for row in values:
+        rec = {}
+        for cname, pos in col_positions:
+            rec[cname] = row[pos]
+        records.append(rec)
+
+    if _COL_NAME not in seen_cols:
         logger.error("Kolom %s tidak ada di data CFTC", _COL_NAME)
         result["_meta"]["stale"] = True
         result["_meta"]["assets_missing"] = list(COT_CATEGORY.keys())
         return result
 
-    # Dedup per (market, date), ambil terbaru
-    date_col = _date_col(combined)
-    if date_col:
+    # Cari kolom tanggal (nama, dari records)
+    date_col = None
+    for cname, _ in col_positions:
+        cl = cname.lower()
+        if "report" in cl and "date" in cl:
+            date_col = cname
+            break
+
+    # Parse tanggal + sort + dedup per (market, date) — Python murni
+    def _parse_date(v):
         try:
-            combined["_d"] = pd.to_datetime(combined[date_col], errors="coerce")
-            combined = combined.sort_values("_d").drop_duplicates(
-                subset=[_COL_NAME, "_d"], keep="last"
-            ).reset_index(drop=True)   # FIX: index unik → cegah "Reindexing only valid with uniquely valued Index"
-            result["_meta"]["weeks_history"] = int(combined["_d"].dropna().nunique())
-        except Exception as exc:
-            logger.warning("Gagal proses kolom tanggal: %s", exc)
+            return pd.to_datetime(v, errors="coerce")
+        except Exception:
+            return pd.NaT
+
+    if date_col:
+        for rec in records:
+            rec["_d"] = _parse_date(rec.get(date_col))
+        # sort by date (NaT paling akhir)
+        records.sort(key=lambda r: (r["_d"] is pd.NaT or pd.isna(r["_d"]), r["_d"] if not pd.isna(r["_d"]) else pd.Timestamp.min))
+        # dedup per (market, date) keep last
+        dedup: dict[tuple, dict] = {}
+        for rec in records:
+            key = (str(rec.get(_COL_NAME)), str(rec.get("_d")))
+            dedup[key] = rec   # last wins
+        records = list(dedup.values())
+        # weeks_history = jumlah tanggal unik
+        uniq_dates = {str(r["_d"]) for r in records if not pd.isna(r.get("_d"))}
+        result["_meta"]["weeks_history"] = len(uniq_dates)
 
     # Stale flag
     if days_since > 10:
@@ -318,7 +355,20 @@ def get_cot() -> dict[str, Any]:
         logger.warning("COT %d hari lama (snapshot %s) — kemungkinan shutdown/delay",
                        days_since, result["as_of_tuesday"])
 
-    # --- Per-asset ---
+    # Helper net dari dict (bukan Series)
+    def _net_from_rec(rec: dict, category: str):
+        cols = _CAT_COLS.get(category)
+        if cols is None:
+            return None
+        long_col, short_col = cols
+        if long_col not in rec or short_col not in rec:
+            return None
+        try:
+            return int(float(rec[long_col]) - float(rec[short_col]))
+        except (TypeError, ValueError):
+            return None
+
+    # --- Per-asset (Python murni, nol pandas indexing) ---
     for asset, category in COT_CATEGORY.items():
         slot: dict[str, Any] = {"category": category, "net": None, "cot_index": None}
 
@@ -328,17 +378,16 @@ def get_cot() -> dict[str, Any]:
             result["_meta"]["assets_missing"].append(asset)
             continue
 
-        # Baris terbaru untuk asset ini
-        amask = combined[_COL_NAME].apply(lambda n: _match_asset(n) == asset)
-        rows = combined[amask.values]   # .values → boolean array tanpa index alignment
-        if rows.empty:
+        # Semua baris utk asset ini (urut kronologis krn records sudah di-sort)
+        asset_rows = [r for r in records if _match_asset(r.get(_COL_NAME)) == asset]
+        if not asset_rows:
             slot["_error"] = "not_found_in_cftc"
             result["cot"][asset] = slot
             result["_meta"]["assets_missing"].append(asset)
             continue
 
-        latest = rows.iloc[-1]
-        net = _extract_net(latest, category)
+        latest = asset_rows[-1]
+        net = _net_from_rec(latest, category)
         if net is None:
             slot["_error"] = "net_extraction_failed"
             result["cot"][asset] = slot
@@ -346,8 +395,17 @@ def get_cot() -> dict[str, Any]:
             continue
 
         slot["net"] = net
-        if date_col:
-            slot["cot_index"] = _compute_cot_index(asset, net, combined, category, date_col)
+        # COT Index = percentile vs window 156 mgg (Python murni)
+        nets = [n for n in (_net_from_rec(r, category) for r in asset_rows) if n is not None]
+        if len(nets) >= _MIN_WEEKS_FOR_INDEX:
+            window = nets[-_FULL_WINDOW_WEEKS:] if len(nets) > _FULL_WINDOW_WEEKS else nets
+            lo, hi = min(window), max(window)
+            if hi == lo:
+                slot["cot_index"] = 50.0
+            else:
+                idx = (net - lo) / (hi - lo) * 100.0
+                slot["cot_index"] = round(max(0.0, min(100.0, idx)), 1)
+
         result["cot"][asset] = slot
         result["_meta"]["assets_ok"].append(asset)
 
