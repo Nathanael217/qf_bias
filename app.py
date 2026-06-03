@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: us-surprise + JOLTS + FMP-layer + ADP-fix (2026-06-03e)
+# QF_BIAS_BUILD: us-surprise + DBnomics-EUR + JOLTS + ADP-fix (2026-06-03f)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -65,6 +65,7 @@ try:
     from collectors.news import get_news as _get_news_raw
     from collectors.calendar_evt import get_calendar as _get_calendar_raw
     from collectors.indicators_us import enrich_us_actuals as _enrich_us_raw
+    from collectors.indicators_world import enrich_world_actuals as _enrich_world_raw
     from collectors.actuals_fmp import enrich_actuals_fmp as _enrich_fmp_raw
     from engine.scoring import compute_all_assets
     from engine.news_overlay import compute_news_delta
@@ -200,6 +201,19 @@ def cached_get_news() -> dict:
             "as_of_utc": fmt_iso_utc(now_utc()),
             "headlines": [], "_error": str(exc),
         }
+
+
+@st.cache_data(ttl=TTL["calendar"], show_spinner=False)
+def cached_enrich_world(events_json: str) -> dict:
+    """Isi actual non-US dari DBnomics (gratis, tanpa key). Cached. Graceful."""
+    import json
+    try:
+        events = json.loads(events_json) if events_json else []
+        return _enrich_world_raw(events)
+    except Exception as exc:
+        logger.error("enrich_world_actuals() exception: %s", exc)
+        import json as _j
+        return {"events": _j.loads(events_json) if events_json else [], "enriched": [], "_meta": {"error": str(exc)}}
 
 
 @st.cache_data(ttl=TTL["calendar"], show_spinner=False)
@@ -825,20 +839,26 @@ def render_key_risk_events(calendar_data: dict) -> None:
     _us_meta = calendar_data.get("_us_meta", {})
     _fmp_enr = calendar_data.get("_fmp_enriched", [])
     _fmp_meta = calendar_data.get("_fmp_meta", {})
+    _world_enr = calendar_data.get("_world_enriched", [])
+    _world_meta = calendar_data.get("_world_meta", {})
     # Status enrichment SELALU tampil (jangan biarkan user menebak kenapa actual kosong)
     _bits = []
     if _us_enr:
-        _bits.append(f"🟢 FRED (skor): {len(_us_enr)} → {', '.join(_us_enr[:5])}" + (" …" if len(_us_enr) > 5 else ""))
+        _bits.append(f"🟢 FRED US (skor): {len(_us_enr)} → {', '.join(_us_enr[:5])}" + (" …" if len(_us_enr) > 5 else ""))
     elif _us_meta.get("error"):
         _bits.append(f"⚠ FRED gagal: {_us_meta['error']}")
     else:
-        _bits.append("⚪ FRED: 0 event US ber-mapping yang sudah rilis di window ini (CPI/NFP/PCE/JOLTS/Claims bulanan)")
+        _bits.append("⚪ FRED US: 0 event ber-mapping yang rilis di window ini")
+    if _world_enr:
+        _bits.append(f"🟢 DBnomics non-US (skor): {len(_world_enr)} → {', '.join(_world_enr[:5])}" + (" …" if len(_world_enr) > 5 else ""))
+    elif _world_meta.get("failed_series"):
+        _bits.append(f"⚠ DBnomics seri gagal resolve: {', '.join(_world_meta['failed_series'])} (cek kode di browser)")
     if _fmp_enr:
         _bits.append(f"🔵 FMP (display): {len(_fmp_enr)} → {', '.join(_fmp_enr[:5])}" + (" …" if len(_fmp_enr) > 5 else ""))
     elif _fmp_meta.get("error"):
         _bits.append(f"⚠ FMP gagal: {_fmp_meta['error']}")
     elif _fmp_meta.get("note", "").startswith("FMP_API_KEY"):
-        _bits.append("⚪ FMP nonaktif (set FMP_API_KEY di Secrets untuk actual ISM dll)")
+        _bits.append("⚪ FMP nonaktif (free tier FMP tak punya economic calendar)")
     for _b in _bits:
         st.caption(_b)
     if calendar_data.get("_error") and not events:
@@ -1297,6 +1317,12 @@ def main() -> None:
         calendar_data["events"] = _enrich.get("events", calendar_data.get("events", []))
         calendar_data["_us_enriched"] = _enrich.get("enriched", [])
         calendar_data["_us_meta"] = _enrich.get("_meta", {})
+
+        # Lapisan DBnomics (gratis, tanpa key): isi actual NON-US (EUR dulu) — IKUT skor (ber-σ).
+        _world = cached_enrich_world(json.dumps(calendar_data.get("events", [])))
+        calendar_data["events"] = _world.get("events", calendar_data.get("events", []))
+        calendar_data["_world_enriched"] = _world.get("enriched", [])
+        calendar_data["_world_meta"] = _world.get("_meta", {})
 
         # Lapisan FMP (opsional, key-gated): isi actual sisanya (ISM dll) — DISPLAY ONLY.
         _fmp = cached_enrich_fmp(json.dumps(calendar_data.get("events", [])))
