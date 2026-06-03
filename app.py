@@ -722,7 +722,7 @@ def render_key_risk_events(calendar_data: dict) -> None:
     hcol, rcol = st.columns([5, 1])
     with hcol:
         st.subheader("⏰ Key Risk Events")
-        st.caption("build: rev-D · Hari Ini / Minggu Ini")  # penanda versi → verifikasi deploy
+        st.caption("build: rev-E · debug window")  # penanda versi → verifikasi deploy
     with rcol:
         if st.button("🔄 Refresh", key="refresh_risk", help="Muat ulang kalendar", use_container_width=True):
             clear_all_caches()
@@ -822,6 +822,21 @@ def render_key_risk_events(calendar_data: dict) -> None:
     n_impact = sum(1 for e in events if _in_window(e, w_start, w_end)
                    and (not impact_filter or e.get("impact", "LOW") in impact_filter))
     if not subset and events:
+        # === DUMP MENTAH untuk debug: nilai aktual di server ===
+        sample_lines = []
+        for e in events[:3]:
+            ts = e.get("ts_utc", "(no ts_utc)")
+            ew = _ev_wib(e)
+            sample_lines.append(f"ts_utc={ts!r} → _ev_wib={ew}")
+        st.error(
+            "🔧 DEBUG rev-D:\n\n"
+            f"now_w = {now_w}\n\n"
+            f"today_start = {today_start} | today_end = {today_end}\n\n"
+            f"monday = {monday} | sunday_end = {sunday_end}\n\n"
+            f"w_start = {w_start} | w_end = {w_end}\n\n"
+            f"mode = {mode!r}\n\n"
+            f"sample events:\n- " + "\n- ".join(sample_lines)
+        )
         # Pecah penyebab
         statuses = {}
         for e in events:
