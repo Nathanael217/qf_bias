@@ -722,7 +722,7 @@ def render_key_risk_events(calendar_data: dict) -> None:
     hcol, rcol = st.columns([5, 1])
     with hcol:
         st.subheader("⏰ Key Risk Events")
-        st.caption("build: rev-E · debug window")  # penanda versi → verifikasi deploy
+        st.caption("build: rev-F · fix tz")  # penanda versi → verifikasi deploy
     with rcol:
         if st.button("🔄 Refresh", key="refresh_risk", help="Muat ulang kalendar", use_container_width=True):
             clear_all_caches()
@@ -736,7 +736,9 @@ def render_key_risk_events(calendar_data: dict) -> None:
         st.info("Tidak ada event dalam window.")
         return
 
-    now_w = now_wib()
+    from datetime import timezone as _tz0, timedelta as _td0
+    _WIB0 = _tz0(_td0(hours=7))
+    now_w = now_utc().astimezone(_WIB0)   # offset tetap → tidak bergantung tzdata/ZoneInfo
 
     # --- Window "Hari Ini" = 07:00 WIB hari ini → 07:00 WIB besok ---
     today_anchor = now_w.replace(hour=7, minute=0, second=0, microsecond=0)
@@ -749,11 +751,15 @@ def render_key_risk_events(calendar_data: dict) -> None:
     monday = (now_w - timedelta(days=now_w.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     sunday_end = monday + timedelta(days=7)
 
+    from datetime import timezone as _tz, timedelta as _td
+    _WIB_FIXED = _tz(_td(hours=7))   # offset tetap, tidak butuh tzdata/ZoneInfo
+
     def _ev_wib(ev: dict):
         ts = ev.get("ts_utc", "")
         try:
-            return parse_iso_utc(ts).astimezone(now_w.tzinfo)
-        except Exception:
+            dt = parse_iso_utc(ts)            # → UTC-aware
+            return dt.astimezone(_WIB_FIXED)  # konversi via offset tetap (selalu jalan)
+        except Exception as _exc:
             return None
 
     # ---- MODE PICKER: Last / This / Upcoming Week ----
