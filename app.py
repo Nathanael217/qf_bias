@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: us-surprise + JOLTS + FMP-actual-layer (2026-06-03d)
+# QF_BIAS_BUILD: us-surprise + JOLTS + FMP-layer + ADP-fix (2026-06-03e)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
