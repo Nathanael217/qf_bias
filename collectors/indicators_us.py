@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: indicators_us — FRED actual enrichment for US surprise factor (2026-06-03)
+# QF_BIAS_BUILD: indicators_us — FRED actual + ADP/core-retail misattribution fix (2026-06-03e)
 """
 collectors/indicators_us.py — Isi `actual` event kalender US dari FRED.
 
@@ -61,9 +61,9 @@ US_INDICATOR_MAP: list[dict[str, Any]] = [
     {"match": "cpi m/m",                      "series": "CPIAUCSL", "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "CPI m/m"},
     {"match": "core pce price index m/m",     "series": "PCEPILFE", "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Core PCE m/m"},
     {"match": "core pce m/m",                 "series": "PCEPILFE", "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Core PCE m/m"},
-    {"match": "retail sales m/m",             "series": "RSAFS",    "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Retail Sales m/m"},
+    {"match": "retail sales m/m",             "series": "RSAFS",    "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Retail Sales m/m", "exclude": ["core"]},
     {"match": "jolts job openings",           "series": "JTSJOL",   "transform": "level",   "polarity": +1, "scale": 1000.0, "label": "JOLTS Job Openings"},
-    {"match": "non-farm employment change",   "series": "PAYEMS",   "transform": "diff",    "polarity": +1, "scale": 1000.0, "label": "Non-Farm Payrolls"},
+    {"match": "non-farm employment change",   "series": "PAYEMS",   "transform": "diff",    "polarity": +1, "scale": 1000.0, "label": "Non-Farm Payrolls", "exclude": ["adp"]},
 ]
 
 
@@ -72,7 +72,7 @@ def _match_indicator(event_name: str) -> dict | None:
     Urutan penting: 'core cpi m/m' dicek sebelum 'cpi m/m'."""
     n = (event_name or "").lower()
     for spec in US_INDICATOR_MAP:
-        if spec["match"] in n:
+        if spec["match"] in n and not any(x in n for x in spec.get("exclude", [])):
             return spec
     return None
 
