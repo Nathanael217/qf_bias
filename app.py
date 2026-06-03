@@ -795,12 +795,30 @@ def render_key_risk_events(calendar_data: dict) -> None:
         d_end = d_start + timedelta(days=1)
         subset = [e for e in subset if _in_window(e, d_start, d_end)]
 
-    # Diagnostik jujur: kalau total events ada tapi subset kosong → jelaskan
+    # Diagnostik rinci: tunjukkan PERSIS berapa event lolos tiap tahap (akhiri tebakan)
+    n_total = len(events)
+    n_in_window = sum(1 for e in events if _in_window(e, w_start, w_end))
+    n_impact = sum(1 for e in events if _in_window(e, w_start, w_end)
+                   and (not impact_filter or e.get("impact", "LOW") in impact_filter))
     if not subset and events:
+        # Pecah penyebab
+        statuses = {}
+        for e in events:
+            if _in_window(e, w_start, w_end):
+                statuses[e.get("status", "?")] = statuses.get(e.get("status", "?"), 0) + 1
+        ccy_in_window = sorted({e.get("currency", "?") for e in events if _in_window(e, w_start, w_end)})
         st.warning(
-            f"⚠ Ada {len(events)} event ter-fetch tapi 0 lolos filter di window ini. "
-            f"Coba longgarkan Filter Impact (centang LOW juga) atau kosongkan Filter Currency."
+            f"⚠ Diagnostik filter:\n\n"
+            f"- Total event ter-fetch: **{n_total}**\n"
+            f"- Lolos window waktu ini: **{n_in_window}** (status: {statuses})\n"
+            f"- Setelah filter impact: **{n_impact}**\n"
+            f"- Setelah filter currency: **{len(subset)}**\n\n"
+            f"Currency yang ADA di window: {ccy_in_window}\n\n"
+            f"**Saran:** kalau 'lolos window' = 0 → tidak ada event di rentang waktu ini "
+            f"(normal di pagi/malam). Kalau >0 tapi akhirnya 0 → filter currency/impact terlalu ketat."
         )
+    elif n_in_window > 0:
+        st.caption(f"📊 {n_in_window} event di window · {n_impact} lolos impact · {len(subset)} setelah currency")
 
     upcoming = sorted([e for e in subset if e.get("status") == "upcoming"], key=lambda e: e.get("ts_utc", ""))
     released = sorted([e for e in subset if e.get("status") == "released"], key=lambda e: e.get("ts_utc", ""), reverse=True)
