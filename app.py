@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: riskevents-parsehardened + nf-filters + news-multisource (2026-06-03b)
+# QF_BIAS_BUILD: us-surprise-factor (FRED actual + sigma + polarity + time-decay) (2026-06-03c)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -64,6 +64,7 @@ try:
     from collectors.retail import get_retail as _get_retail_raw
     from collectors.news import get_news as _get_news_raw
     from collectors.calendar_evt import get_calendar as _get_calendar_raw
+    from collectors.indicators_us import enrich_us_actuals as _enrich_us_raw
     from engine.scoring import compute_all_assets
     from engine.news_overlay import compute_news_delta
     from engine.confidence import compute_confidence
@@ -198,6 +199,20 @@ def cached_get_news() -> dict:
             "as_of_utc": fmt_iso_utc(now_utc()),
             "headlines": [], "_error": str(exc),
         }
+
+
+@st.cache_data(ttl=TTL["calendar"], show_spinner=False)
+def cached_enrich_us(events_json: str) -> dict:
+    """Isi actual event US dari FRED (cached). Terima json string utk hashability.
+    Graceful: gagal → kembalikan events apa adanya (tanpa actual)."""
+    import json
+    try:
+        events = json.loads(events_json) if events_json else []
+        return _enrich_us_raw(events)
+    except Exception as exc:
+        logger.error("enrich_us_actuals() exception: %s", exc)
+        import json as _j
+        return {"events": _j.loads(events_json) if events_json else [], "enriched": [], "_meta": {"error": str(exc)}}
 
 
 @st.cache_data(ttl=TTL["calendar"], show_spinner=False)
@@ -791,6 +806,13 @@ def render_key_risk_events(calendar_data: dict) -> None:
             st.rerun()
 
     events = calendar_data.get("events", [])
+    _us_enr = calendar_data.get("_us_enriched", [])
+    _us_meta = calendar_data.get("_us_meta", {})
+    if _us_enr:
+        st.caption(f"🟢 Actual US dari FRED terisi untuk {len(_us_enr)} event: {', '.join(_us_enr[:6])}"
+                   + (" …" if len(_us_enr) > 6 else ""))
+    elif _us_meta.get("error"):
+        st.caption(f"⚠ FRED actual gagal: {_us_meta['error']}")
     if calendar_data.get("_error") and not events:
         st.warning(f"Calendar fetch gagal: {calendar_data['_error']}")
         return
@@ -957,6 +979,25 @@ def render_key_risk_events(calendar_data: dict) -> None:
                 st.markdown(f"<span style='font-weight:700;font-size:0.85rem;'>{currency}</span>", unsafe_allow_html=True)
             with col_name:
                 st.markdown(f"<div style='font-size:0.87rem;font-weight:600;'>{name}</div>", unsafe_allow_html=True)
+                # Surprise tag: hanya untuk event yang actual-nya dari FRED + ada forecast
+                pol = ev.get("surprise_polarity")
+                if is_released and pol is not None and actual is not None and forecast is not None:
+                    try:
+                        delta = (float(actual) - float(forecast)) * float(pol)
+                        if abs(delta) < 1e-9:
+                            arrow, scol, lbl = "→", "#9ca3af", "in-line"
+                        elif delta > 0:
+                            arrow, scol, lbl = "▲", "#16a34a", f"{currency} bullish"
+                        else:
+                            arrow, scol, lbl = "▼", "#dc2626", f"{currency} bearish"
+                        src = ev.get("actual_source", "")
+                        st.markdown(
+                            f"<div style='font-size:0.7rem;color:{scol};'>{arrow} surprise → {lbl}"
+                            f"<span style='color:#6b7280;'> &nbsp;{src}</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                    except (TypeError, ValueError):
+                        pass
 
             def _stat(label, val, color="#e5e7eb"):
                 shown = val if val is not None else "–"
@@ -1221,8 +1262,15 @@ def main() -> None:
         # Calendar dulu — diperlukan oleh macro untuk surprises
         calendar_data = cached_get_calendar()
 
-        # Released events → surprises untuk macro
+        # Isi `actual` event US dari FRED (faireconomy tidak kasih actual).
         import json
+        _enrich = cached_enrich_us(json.dumps(calendar_data.get("events", [])))
+        calendar_data = dict(calendar_data)                 # salinan dangkal (jangan mutasi cache)
+        calendar_data["events"] = _enrich.get("events", calendar_data.get("events", []))
+        calendar_data["_us_enriched"] = _enrich.get("enriched", [])
+        calendar_data["_us_meta"] = _enrich.get("_meta", {})
+
+        # Released events → surprises untuk macro
         released_events = [
             e for e in calendar_data.get("events", [])
             if e.get("status") == "released"
