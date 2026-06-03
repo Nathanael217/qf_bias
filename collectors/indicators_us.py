@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: indicators_us — FRED actual + ADP/core-retail misattribution fix (2026-06-03e)
+# QF_BIAS_BUILD: indicators_us — FRED actual + ADP-fix + previous-alignment guard (2026-06-03g)
 """
 collectors/indicators_us.py — Isi `actual` event kalender US dari FRED.
 
@@ -106,6 +106,37 @@ def _fetch_fred_series(series_id: str, api_key: str, session: requests.Session,
     return []
 
 
+def implied_previous(vals: list[float], transform: str, scale: float) -> float | None:
+    """Nilai periode SEBELUMNYA dalam metrik kalender (untuk validasi alignment).
+    Bandingkan ini dgn `previous` kalender: kalau jauh beda → seri/timing tak cocok."""
+    try:
+        if transform == "level":
+            return vals[1] * scale if len(vals) >= 2 else None
+        if transform == "mom_pct":
+            return round(((vals[2] and (vals[1] / vals[2] - 1.0) * 100.0)), 4) if len(vals) >= 3 and vals[2] else None
+        if transform == "diff":
+            return (vals[1] - vals[2]) * scale if len(vals) >= 3 else None
+    except (ZeroDivisionError, TypeError, ValueError, IndexError):
+        return None
+    return None
+
+
+def previous_aligned(vals: list[float], transform: str, scale: float, cal_previous) -> bool:
+    """True jika previous DBnomics/FRED cocok dgn `previous` kalender (toleransi relatif).
+    Kalau `cal_previous` tidak ada → True (tak bisa divalidasi, jangan blokir)."""
+    if cal_previous is None:
+        return True
+    try:
+        cp = float(cal_previous)
+    except (TypeError, ValueError):
+        return True
+    ip = implied_previous(vals, transform, scale)
+    if ip is None:
+        return True  # tak cukup data utk validasi → jangan blokir
+    tol = max(abs(cp) * 0.05, 0.1)
+    return abs(ip - cp) <= tol
+
+
 def compute_actual_and_sigma(vals: list[float], transform: str, scale: float) -> tuple[float | None, float | None]:
     """Dari deret FRED (desc, terbaru dulu) → (actual, σ) dalam unit kalender.
 
@@ -148,6 +179,7 @@ def enrich_us_actuals(events: list[dict], api_key: str | None = None) -> dict:
     """
     api_key = api_key or _get_fred_key()
     enriched: list[str] = []
+    mismatched: list[str] = []
     if not api_key:
         return {"events": events, "enriched": [], "_meta": {"error": "FRED_API_KEY tidak ada"}}
 
@@ -174,6 +206,11 @@ def enrich_us_actuals(events: list[dict], api_key: str | None = None) -> dict:
         actual, sigma = compute_actual_and_sigma(series_cache[sid], spec["transform"], spec["scale"])
         if actual is None:
             continue
+        # GUARD alignment: previous DBnomics/FRED harus cocok previous kalender,
+        # kalau tidak → seri/timing salah → JANGAN isi (cegah actual keliru masuk skor).
+        if not previous_aligned(series_cache[sid], spec["transform"], spec["scale"], ev.get("previous")):
+            mismatched.append(f"{ev.get('name','?')} (FRED:{sid})")
+            continue
         ev["actual"] = actual
         ev["historical_std"] = sigma                  # bisa None → build_surprises fallback ke raw delta
         ev["surprise_polarity"] = float(spec["polarity"])
@@ -183,5 +220,5 @@ def enrich_us_actuals(events: list[dict], api_key: str | None = None) -> dict:
     return {
         "events": events,
         "enriched": enriched,
-        "_meta": {"series_fetched": fetched, "matched": len(targets)},
+        "_meta": {"series_fetched": fetched, "matched": len(targets), "mismatched": mismatched},
     }
