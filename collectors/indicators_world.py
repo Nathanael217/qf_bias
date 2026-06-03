@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: indicators_world — DBnomics actual enrichment for non-US (EUR first) (2026-06-03)
+# QF_BIAS_BUILD: indicators_world — DBnomics non-US (EUR) + alignment guard (2026-06-03g)
 """
 collectors/indicators_world.py — Isi `actual` event NON-US dari DBnomics.
 
@@ -29,7 +29,7 @@ import time
 
 import requests
 
-from collectors.indicators_us import compute_actual_and_sigma  # reuse transform+σ teruji
+from collectors.indicators_us import compute_actual_and_sigma, previous_aligned  # reuse teruji
 from utils.timeutils import parse_iso_utc  # noqa: F401 (dipakai bila perlu di masa depan)
 
 logger = logging.getLogger(__name__)
@@ -108,7 +108,7 @@ def enrich_world_actuals(events: list[dict]) -> dict:
         return {"events": events, "enriched": [], "_meta": {"note": "tidak ada event non-US cocok mapping"}}
 
     cache: dict[str, list[float]] = {}
-    resolved, failed = [], []
+    resolved, failed, mismatched = [], [], []
     for ev in targets:
         spec = _match_world(ev.get("name", ""), ev.get("currency", ""))
         key = f"{spec['provider']}/{spec['dataset']}/{spec['series']}"
@@ -123,6 +123,11 @@ def enrich_world_actuals(events: list[dict]) -> dict:
         if actual is None:
             failed.append(key)
             continue
+        # GUARD alignment: previous seri harus cocok previous kalender; kalau tidak →
+        # seri/vintage/timing salah → JANGAN isi (cegah actual keliru spt EUR 1.9 vs prev 3.0).
+        if not previous_aligned(vals, spec["transform"], spec["scale"], ev.get("previous")):
+            mismatched.append(f"{ev.get('name','?')} ({key})")
+            continue
         ev["actual"] = actual
         ev["historical_std"] = sigma
         ev["surprise_polarity"] = float(spec["polarity"])
@@ -131,4 +136,4 @@ def enrich_world_actuals(events: list[dict]) -> dict:
 
     return {"events": events, "enriched": resolved,
             "_meta": {"resolved": resolved, "failed_series": sorted(set(failed)),
-                      "matched": len(targets)}}
+                      "mismatched": mismatched, "matched": len(targets)}}
