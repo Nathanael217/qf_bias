@@ -34,6 +34,7 @@ from config import (
     bias_label,
 )
 from engine.freshness import cot_freshness
+from utils.timeutils import age_minutes
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,15 @@ _RHARD_Z_CLAMP: float = 3.0
 Clamp z-score sebelum normalisasi ke [-1,1].
 z di luar [-3,3] diperlakukan sebagai kejutan ekstrem maksimum.
 ⚠ PLACEHOLDER.
+"""
+
+_SURPRISE_DECAY_DAYS: float = 2.0
+"""
+Konstanta peluruhan bobot surprise terhadap UMUR event (hari).
+decay = exp(-age_hari / _SURPRISE_DECAY_DAYS).
+  age 0h → 1.00 | 1 hari → 0.61 | 2 hari → 0.37 | 3 hari → 0.22
+Inilah yang membuat "besok/lusa/3 hari" bobotnya berbeda.
+⚠ PLACEHOLDER — kalibrasi dari seberapa cepat efek surprise hilang dari harga (backtest).
 """
 
 _RHARD_DIFF_MAX: float = 5.0
@@ -155,7 +165,18 @@ def score_R_hard(macro: dict[str, Any], asset: str) -> tuple[float, str]:
             z_raw = float(latest["z"])
             z_clamped = _clamp(z_raw, -_RHARD_Z_CLAMP, _RHARD_Z_CLAMP)
             z_norm = z_clamped / _RHARD_Z_CLAMP
-            z_detail = f"{latest.get('event','?')} z={z_raw:.2f}"
+            # Time-decay: bobot surprise melemah seiring umur event
+            # (besok/lusa/3 hari berbeda). decay = exp(-age_hari/_SURPRISE_DECAY_DAYS).
+            decay = 1.0
+            ts = latest.get("ts_utc")
+            if ts:
+                try:
+                    age_days = max(0.0, age_minutes(ts) / 1440.0)
+                    decay = math.exp(-age_days / _SURPRISE_DECAY_DAYS)
+                except Exception:
+                    decay = 1.0
+            z_norm *= decay
+            z_detail = f"{latest.get('event','?')} z={z_raw:.2f} ×decay{decay:.2f}"
         else:
             z_detail = "surprises ada tapi z=None"
     else:
