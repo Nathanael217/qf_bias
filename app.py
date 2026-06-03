@@ -600,6 +600,26 @@ def render_news_feed(news_clusters: list[dict]) -> None:
             st.rerun()
 
     if not news_clusters:
+        # Fallback: tampilkan headline mentah dari cache kalau cluster kosong
+        try:
+            raw = cached_get_news()
+            hls = raw.get("headlines", []) if isinstance(raw, dict) else []
+        except Exception:
+            hls = []
+        if hls:
+            st.caption(f"⚠ Clustering kosong — menampilkan {len(hls)} headline mentah.")
+            for h in hls[:40]:
+                title = h.get("title", "–")
+                ts_wib = h.get("ts_wib", "")
+                link = h.get("link", "")
+                src = h.get("source", "")
+                line = f"**{src}:** {title}" if src else title
+                if link:
+                    line += f" &nbsp;[🔗 buka]({link})"
+                st.markdown(f"<div style='font-size:0.88rem;margin:2px 0;'>{line} "
+                            f"<span style='color:#6b7280;font-size:0.72rem;'>· {ts_wib} WIB</span></div>",
+                            unsafe_allow_html=True)
+            return
         st.info("Tidak ada news cluster saat ini — feed kosong atau semua event sudah decay.")
         return
 
@@ -702,6 +722,7 @@ def render_key_risk_events(calendar_data: dict) -> None:
     hcol, rcol = st.columns([5, 1])
     with hcol:
         st.subheader("⏰ Key Risk Events")
+        st.caption("build: rev-D · Hari Ini / Minggu Ini")  # penanda versi → verifikasi deploy
     with rcol:
         if st.button("🔄 Refresh", key="refresh_risk", help="Muat ulang kalendar", use_container_width=True):
             clear_all_caches()
