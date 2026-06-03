@@ -137,6 +137,7 @@ def _load_zip(content: bytes) -> pd.DataFrame | None:
             raw = z.read(txt[0])
         df = pd.read_csv(io.BytesIO(raw), low_memory=False)
         df.columns = df.columns.str.strip()
+        df = df.loc[:, ~df.columns.duplicated()]   # buang kolom duplikat → cegah concat reindex crash
         return df
     except Exception as exc:
         logger.error("Gagal parse zip CFTC: %s", exc)
@@ -148,6 +149,7 @@ def _load_txt(content: bytes) -> pd.DataFrame | None:
     try:
         df = pd.read_csv(io.BytesIO(content), low_memory=False)
         df.columns = df.columns.str.strip()
+        df = df.loc[:, ~df.columns.duplicated()]   # buang kolom duplikat → cegah concat reindex crash
         return df
     except Exception as exc:
         logger.error("Gagal parse weekly TFF: %s", exc)
