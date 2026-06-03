@@ -1,3 +1,4 @@
+# QF_BIAS_BUILD: news-multisource + nf-filters + riskevents-weekly-fix (2026-06-03)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -588,8 +589,18 @@ def render_pair_scanner(
 # SECTION 4c — NEWS FEED
 # ===========================================================================
 
-def render_news_feed(news_clusters: list[dict]) -> None:
-    """Render news clusters (sudah dedup) dari engine/news_overlay."""
+def render_news_feed(
+    news_clusters: list[dict],
+    news_delta_map: dict[str, float] | None = None,
+    news_meta: dict | None = None,
+) -> None:
+    """Render news clusters (sudah dedup) dari engine/news_overlay.
+
+    news_delta_map : net Δ per aset (untuk ringkasan di atas feed).
+    news_meta       : dict hasil get_news (untuk status sumber: ok/gagal).
+    """
+    news_delta_map = news_delta_map or {}
+    news_meta = news_meta or {}
 
     hcol, rcol = st.columns([5, 1])
     with hcol:
@@ -599,32 +610,84 @@ def render_news_feed(news_clusters: list[dict]) -> None:
             clear_all_caches()
             st.rerun()
 
+    # --- Status sumber (mana yang hidup / gagal) — tutup celah "error ditelan" ---
+    ok = news_meta.get("sources_ok", [])
+    failed = news_meta.get("sources_failed", [])
+    if ok or failed:
+        parts = []
+        if ok:
+            parts.append("✅ aktif: " + ", ".join(ok))
+        if failed:
+            parts.append("✗ gagal: " + ", ".join(failed))
+        st.caption(" &nbsp;·&nbsp; ".join(parts))
+    if news_meta.get("error") and not news_clusters:
+        st.warning(f"Semua feed news gagal: {news_meta['error']}")
+
     if not news_clusters:
-        # Fallback: tampilkan headline mentah dari cache kalau cluster kosong
-        try:
-            raw = cached_get_news()
-            hls = raw.get("headlines", []) if isinstance(raw, dict) else []
-        except Exception:
-            hls = []
-        if hls:
-            st.caption(f"⚠ Clustering kosong — menampilkan {len(hls)} headline mentah.")
-            for h in hls[:40]:
-                title = h.get("title", "–")
-                ts_wib = h.get("ts_wib", "")
-                link = h.get("link", "")
-                src = h.get("source", "")
-                line = f"**{src}:** {title}" if src else title
-                if link:
-                    line += f" &nbsp;[🔗 buka]({link})"
-                st.markdown(f"<div style='font-size:0.88rem;margin:2px 0;'>{line} "
-                            f"<span style='color:#6b7280;font-size:0.72rem;'>· {ts_wib} WIB</span></div>",
-                            unsafe_allow_html=True)
-            return
         st.info("Tidak ada news cluster saat ini — feed kosong atau semua event sudah decay.")
         return
 
-    # Filter: tampilkan semua cluster, sort by age (terbaru dulu)
-    sorted_clusters = sorted(news_clusters, key=lambda c: c.get("age_min", 9999))
+    # --- Ringkasan net news Δ per aset (TAMBAHAN b) ---
+    nz_delta = {a: v for a, v in news_delta_map.items() if abs(v) >= 0.05}
+    if nz_delta:
+        chips = []
+        for a, v in sorted(nz_delta.items(), key=lambda kv: -abs(kv[1])):
+            col = "#16a34a" if v > 0 else "#dc2626"
+            chips.append(
+                f"<span style='background:#111827;border:1px solid {col};color:{col};"
+                f"padding:2px 8px;border-radius:10px;font-size:0.78rem;font-weight:700;'>"
+                f"{a} {v:+.1f}</span>"
+            )
+        st.markdown(
+            "<div style='font-size:0.72rem;color:#6b7280;text-transform:uppercase;"
+            "letter-spacing:0.04em;margin-bottom:4px;'>Net News Δ (cap ±30, placeholder)</div>"
+            "<div style='display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;'>"
+            + " ".join(chips) + "</div>",
+            unsafe_allow_html=True,
+        )
+
+    # --- Kontrol: filter aset, sembunyikan netral, sort (TAMBAHAN a + c) ---
+    avail_assets = sorted({
+        a for c in news_clusters
+        for a, v in c.get("direction", {}).items() if v != "0"
+    })
+    f1, f2, f3 = st.columns([2.2, 1.4, 1.4])
+    with f1:
+        asset_filter = st.multiselect(
+            "Filter aset", options=avail_assets, default=[],
+            key="nf_asset", help="Kosong = semua. Hanya tampilkan cluster yang menyentuh aset terpilih.",
+        )
+    with f2:
+        hide_neutral = st.toggle(
+            "Sembunyikan netral", value=True, key="nf_hideneutral",
+            help="Sembunyikan cluster tanpa reaksi aset (–) — buang noise.",
+        )
+    with f3:
+        sort_mode = st.selectbox(
+            "Urutkan", options=["Terbaru", "Magnitude"], index=0, key="nf_sort",
+        )
+
+    # --- Terapkan filter ---
+    filtered = []
+    for c in news_clusters:
+        reactions = {a: v for a, v in c.get("direction", {}).items() if v != "0"}
+        if hide_neutral and not reactions:
+            continue
+        if asset_filter and not any(a in reactions for a in asset_filter):
+            continue
+        filtered.append(c)
+
+    if not filtered:
+        st.info("Tidak ada cluster yang lolos filter saat ini.")
+        return
+
+    # --- Terapkan sort ---
+    if sort_mode == "Magnitude":
+        sorted_clusters = sorted(filtered, key=lambda c: c.get("magnitude", 0.0), reverse=True)
+    else:
+        sorted_clusters = sorted(filtered, key=lambda c: c.get("age_min", 9999))
+
+    st.caption(f"Menampilkan {len(sorted_clusters)} dari {len(news_clusters)} cluster")
 
     for cluster in sorted_clusters:
         event_title = cluster.get("event", "–")
@@ -722,7 +785,6 @@ def render_key_risk_events(calendar_data: dict) -> None:
     hcol, rcol = st.columns([5, 1])
     with hcol:
         st.subheader("⏰ Key Risk Events")
-        st.caption("build: rev-F · fix tz")  # penanda versi → verifikasi deploy
     with rcol:
         if st.button("🔄 Refresh", key="refresh_risk", help="Muat ulang kalendar", use_container_width=True):
             clear_all_caches()
@@ -736,9 +798,7 @@ def render_key_risk_events(calendar_data: dict) -> None:
         st.info("Tidak ada event dalam window.")
         return
 
-    from datetime import timezone as _tz0, timedelta as _td0
-    _WIB0 = _tz0(_td0(hours=7))
-    now_w = now_utc().astimezone(_WIB0)   # offset tetap → tidak bergantung tzdata/ZoneInfo
+    now_w = now_wib()
 
     # --- Window "Hari Ini" = 07:00 WIB hari ini → 07:00 WIB besok ---
     today_anchor = now_w.replace(hour=7, minute=0, second=0, microsecond=0)
@@ -751,15 +811,11 @@ def render_key_risk_events(calendar_data: dict) -> None:
     monday = (now_w - timedelta(days=now_w.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     sunday_end = monday + timedelta(days=7)
 
-    from datetime import timezone as _tz, timedelta as _td
-    _WIB_FIXED = _tz(_td(hours=7))   # offset tetap, tidak butuh tzdata/ZoneInfo
-
     def _ev_wib(ev: dict):
         ts = ev.get("ts_utc", "")
         try:
-            dt = parse_iso_utc(ts)            # → UTC-aware
-            return dt.astimezone(_WIB_FIXED)  # konversi via offset tetap (selalu jalan)
-        except Exception as _exc:
+            return parse_iso_utc(ts).astimezone(now_w.tzinfo)
+        except Exception:
             return None
 
     # ---- MODE PICKER: Last / This / Upcoming Week ----
@@ -828,21 +884,6 @@ def render_key_risk_events(calendar_data: dict) -> None:
     n_impact = sum(1 for e in events if _in_window(e, w_start, w_end)
                    and (not impact_filter or e.get("impact", "LOW") in impact_filter))
     if not subset and events:
-        # === DUMP MENTAH untuk debug: nilai aktual di server ===
-        sample_lines = []
-        for e in events[:3]:
-            ts = e.get("ts_utc", "(no ts_utc)")
-            ew = _ev_wib(e)
-            sample_lines.append(f"ts_utc={ts!r} → _ev_wib={ew}")
-        st.error(
-            "🔧 DEBUG rev-D:\n\n"
-            f"now_w = {now_w}\n\n"
-            f"today_start = {today_start} | today_end = {today_end}\n\n"
-            f"monday = {monday} | sunday_end = {sunday_end}\n\n"
-            f"w_start = {w_start} | w_end = {w_end}\n\n"
-            f"mode = {mode!r}\n\n"
-            f"sample events:\n- " + "\n- ".join(sample_lines)
-        )
         # Pecah penyebab
         statuses = {}
         for e in events:
@@ -917,14 +958,21 @@ def render_key_risk_events(calendar_data: dict) -> None:
         else:
             st.info("Tidak ada event historis sesuai filter (atau faireconomy tidak menyediakan).")
     else:
+        is_weekly = (mode == "🗓️ Minggu Ini")
         st.markdown(f"**🔜 Akan Datang ({len(upcoming)})**")
         if upcoming:
             for ev in upcoming: _render_row(ev, is_released=False)
         else:
             st.info("Tidak ada upcoming event sesuai filter.")
         if released:
-            with st.expander(f"✅ Sudah lewat dalam window ini ({len(released)}) — dengan aktual"):
+            if is_weekly:
+                # FIX "Minggu Ini tidak muncul": di tengah minggu mayoritas event
+                # sudah released → JANGAN kubur di expander tertutup. Tampilkan langsung.
+                st.markdown(f"**✅ Sudah Lewat Minggu Ini ({len(released)}) — dengan aktual**")
                 for ev in released: _render_row(ev, is_released=True)
+            else:
+                with st.expander(f"✅ Sudah lewat dalam window ini ({len(released)}) — dengan aktual"):
+                    for ev in released: _render_row(ev, is_released=True)
 
 
 def render_score_detail(
@@ -1289,7 +1337,7 @@ def main() -> None:
 
     with tab_news:
         try:
-            render_news_feed(news_clusters)
+            render_news_feed(news_clusters, news_delta_map, news_data)
         except Exception as exc:
             st.error(f"News Feed error: {exc}")
 
