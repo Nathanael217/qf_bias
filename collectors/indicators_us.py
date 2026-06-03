@@ -62,6 +62,7 @@ US_INDICATOR_MAP: list[dict[str, Any]] = [
     {"match": "core pce price index m/m",     "series": "PCEPILFE", "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Core PCE m/m"},
     {"match": "core pce m/m",                 "series": "PCEPILFE", "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Core PCE m/m"},
     {"match": "retail sales m/m",             "series": "RSAFS",    "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Retail Sales m/m"},
+    {"match": "jolts job openings",           "series": "JTSJOL",   "transform": "level",   "polarity": +1, "scale": 1000.0, "label": "JOLTS Job Openings"},
     {"match": "non-farm employment change",   "series": "PAYEMS",   "transform": "diff",    "polarity": +1, "scale": 1000.0, "label": "Non-Farm Payrolls"},
 ]
 
