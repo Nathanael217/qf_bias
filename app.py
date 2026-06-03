@@ -1,224 +1,1500 @@
-# QF_BIAS_BUILD: indicators_us — FRED actual + ADP-fix + previous-alignment guard (2026-06-03g)
+# QF_BIAS_BUILD: us-surprise + DBnomics-EUR + alignment-guard (2026-06-03g)
 """
-collectors/indicators_us.py — Isi `actual` event kalender US dari FRED.
+app.py — QF_BIAS Dashboard (Streamlit)
+========================================
+Entry point tunggal: `streamlit run app.py`
 
-MASALAH yang diselesaikan:
-  faireconomy weekly JSON TIDAK memberi `actual` (sudah dikonfirmasi dari data live —
-  hanya forecast + previous). Tanpa actual, tidak ada surprise untuk dihitung.
-  FRED punya nilai actual rilis untuk indikator US → kita ambil dari sana.
+Alur (§2 Data Flow):
+  1. Header — timestamp UTC+WIB, status sumber, tombol Refresh.
+  2. Collectors (cached TTL) — prices, macro, cot, retail, news, calendar.
+  3. Engine — compute_all_assets → confidence → compute_pairs → compute_news_delta.
+  4. Display — Bias Board | Pair Scanner | News Feed | Key Risk Events | Footer.
 
-LINGKUP (sengaja KECIL & US-only untuk v1 — coverage lain menyusul):
-  Hanya indikator yang UNITnya cocok langsung dengan forecast faireconomy,
-  supaya tidak ada salah-unit diam-diam (landmine utama proyek ini).
+Konvensi import (arsitektur §1.1 — root = import root, tidak ada prefix qf_bias.):
+  from config import ...
+  from utils.timeutils import ...
+  from collectors.prices import get_prices
+  dll.
 
-PRINSIP (dikunci):
-  - Modul ini MENGUKUR (actual, σ, arah). Engine yang MENGHITUNG poin (z → R_hard).
-  - σ = proxy dari volatilitas rilis historis seri itu sendiri (PLACEHOLDER, backtestable).
-    Ini BUKAN σ error-forecast sebenarnya (kita tak punya histori forecast gratis) —
-    ditandai jujur, jangan dipercaya sebelum backtest.
-  - Gagal per-event = graceful: actual tetap None → tidak ada kontribusi surprise → aman.
-
-UNIT-MATCHING (kenapa set ini dipilih — semua cocok langsung dgn _parse_number kalender):
-  Unemployment Rate   : UNRATE      level %      forecast "4.1%"→4.1   cocok   polarity −1
-  Unemployment Claims : ICSA        level count  forecast "214K"→214000 cocok  polarity −1
-  CPI m/m             : CPIAUCSL    mom %        forecast "0.3%"→0.3    cocok   polarity +1
-  Core CPI m/m        : CPILFESL    mom %        forecast "0.3%"→0.3    cocok   polarity +1
-  Core PCE m/m        : PCEPILFE    mom %        forecast "0.3%"→0.3    cocok   polarity +1
-  Retail Sales m/m    : RSAFS       mom %        forecast "0.4%"→0.4    cocok   polarity +1
-  Non-Farm Employment : PAYEMS      mom diff×1e3 forecast "118K"→118000 cocok  polarity +1
-                                    (PAYEMS satuan ribuan → diff ×1000 agar = "118K")
-  polarity: +1 = beat (actual>forecast) bullish currency; −1 = beat bearish (pengangguran).
+Secrets: .streamlit/secrets.toml  (FRED_API_KEY, MYFXBOOK_EMAIL/PASSWORD/SESSION)
 """
 
 from __future__ import annotations
 
+import sys
+import os
+
+# Pastikan root repo ada di sys.path (safety net — Streamlit Cloud biasanya sudah handle ini)
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import logging
-import statistics
-import time
+from datetime import datetime
 from typing import Any
 
-import requests
+import streamlit as st
 
-# Reuse helper FRED dari macro (key + base url) — single source of truth.
-from collectors.macro import _FRED_BASE_URL, _get_fred_key  # type: ignore
+# ---------------------------------------------------------------------------
+# Setup logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s: %(message)s",
+)
+logger = logging.getLogger("app")
 
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# Import modul internal (setelah path setup)
+# ---------------------------------------------------------------------------
+try:
+    from config import (
+        ASSETS_ALL, ASSETS_CRYPTO, ASSETS_FX, ASSET_GOLD,
+        PAIRS, PAIR_META, TTL, bias_label,
+    )
+    from utils.timeutils import (
+        now_utc, now_wib,
+        fmt_iso_utc, fmt_wib_display,
+        countdown_str, minutes_until, age_minutes,
+    )
+    from utils.cache import clear_all_caches, ttl_cache
+    from collectors.prices import get_prices as _get_prices_raw
+    from collectors.macro import get_macro as _get_macro_raw, build_surprises
+    from collectors.cot import get_cot as _get_cot_raw
+    from collectors.retail import get_retail as _get_retail_raw
+    from collectors.news import get_news as _get_news_raw
+    from collectors.calendar_evt import get_calendar as _get_calendar_raw
+    from collectors.indicators_us import enrich_us_actuals as _enrich_us_raw
+    from collectors.indicators_world import enrich_world_actuals as _enrich_world_raw
+    from collectors.actuals_fmp import enrich_actuals_fmp as _enrich_fmp_raw
+    from engine.scoring import compute_all_assets
+    from engine.news_overlay import compute_news_delta
+    from engine.confidence import compute_confidence
+    from engine.pairs import compute_pairs, rank_pairs
+    _IMPORTS_OK = True
+except Exception as _import_err:
+    _IMPORTS_OK = False
+    _IMPORT_ERR_MSG = str(_import_err)
 
-_FRED_TIMEOUT = 12
-_FRED_RETRIES = 2
-_THROTTLE_S = 0.6   # jeda anti-429 (pola sama dgn macro.py)
-_N_OBS = 30         # jumlah observasi historis untuk hitung σ
+# ---------------------------------------------------------------------------
+# Page config (harus sebelum st.* pertama lain)
+# ---------------------------------------------------------------------------
+st.set_page_config(
+    page_title="QF_BIAS — Market Bias Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
-# transform: cara ubah observasi FRED → metrik kalender
-#   "level"   : actual = nilai terbaru;            σ = std(selisih antar-rilis)
-#   "mom_pct" : actual = (v0/v1 − 1)×100;          σ = std(mom% historis)
-#   "diff"    : actual = (v0 − v1) × scale;        σ = std(diff historis × scale)
-# Tiap entry: (fred_series, transform, polarity, scale, label)
-US_INDICATOR_MAP: list[dict[str, Any]] = [
-    {"match": "unemployment rate",            "series": "UNRATE",   "transform": "level",   "polarity": -1, "scale": 1.0,    "label": "Unemployment Rate"},
-    {"match": "unemployment claims",          "series": "ICSA",     "transform": "level",   "polarity": -1, "scale": 1.0,    "label": "Unemployment Claims"},
-    {"match": "core cpi m/m",                 "series": "CPILFESL", "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Core CPI m/m"},
-    {"match": "cpi m/m",                      "series": "CPIAUCSL", "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "CPI m/m"},
-    {"match": "core pce price index m/m",     "series": "PCEPILFE", "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Core PCE m/m"},
-    {"match": "core pce m/m",                 "series": "PCEPILFE", "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Core PCE m/m"},
-    {"match": "retail sales m/m",             "series": "RSAFS",    "transform": "mom_pct", "polarity": +1, "scale": 1.0,    "label": "Retail Sales m/m", "exclude": ["core"]},
-    {"match": "jolts job openings",           "series": "JTSJOL",   "transform": "level",   "polarity": +1, "scale": 1000.0, "label": "JOLTS Job Openings"},
-    {"match": "non-farm employment change",   "series": "PAYEMS",   "transform": "diff",    "polarity": +1, "scale": 1000.0, "label": "Non-Farm Payrolls", "exclude": ["adp"]},
-]
+# ---------------------------------------------------------------------------
+# CSS minimal
+# ---------------------------------------------------------------------------
+st.markdown("""
+<style>
+/* Bias bar container */
+.bias-bar-wrap { width: 100%; background: #e5e7eb; border-radius: 4px; height: 18px; margin: 4px 0; }
+.bias-bar-fill { height: 18px; border-radius: 4px; transition: width 0.3s; }
+
+/* Badge */
+.badge-ok    { background:#16a34a; color:white; padding:2px 8px; border-radius:10px; font-size:0.75rem; font-weight:600; }
+.badge-fail  { background:#dc2626; color:white; padding:2px 8px; border-radius:10px; font-size:0.75rem; font-weight:600; }
+.badge-warn  { background:#d97706; color:white; padding:2px 8px; border-radius:10px; font-size:0.75rem; font-weight:600; }
+
+/* Impact badges */
+.impact-high { background:#ef4444; color:white; padding:1px 7px; border-radius:8px; font-size:0.72rem; font-weight:700; }
+.impact-med  { background:#f59e0b; color:white; padding:1px 7px; border-radius:8px; font-size:0.72rem; font-weight:600; }
+.impact-low  { background:#6b7280; color:white; padding:1px 7px; border-radius:8px; font-size:0.72rem; font-weight:500; }
+
+/* Bias label colors */
+.label-sbull { color:#15803d; font-weight:700; }
+.label-bull  { color:#16a34a; font-weight:600; }
+.label-neut  { color:#6b7280; font-weight:500; }
+.label-bear  { color:#dc2626; font-weight:600; }
+.label-sbear { color:#991b1b; font-weight:700; }
+
+/* Asset card */
+.asset-card { border:1px solid #e5e7eb; border-radius:8px; padding:12px; margin-bottom:6px; background:#fafafa; }
+
+/* Direction sign */
+.dir-plus { color:#16a34a; font-weight:700; }
+.dir-minus { color:#dc2626; font-weight:700; }
+.dir-zero  { color:#9ca3af; }
+
+/* Footer */
+.footer-note { color:#6b7280; font-size:0.78rem; padding:12px; border-top:1px solid #e5e7eb; margin-top:24px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# Guard — jika import gagal
+# ---------------------------------------------------------------------------
+if not _IMPORTS_OK:
+    st.error(f"❌ Import gagal: `{_IMPORT_ERR_MSG}`")
+    st.info("Pastikan kamu menjalankan dari root direktori repo dan semua dependency terinstall.")
+    st.stop()
+
+# ===========================================================================
+# CACHED COLLECTORS  (TTL dari config)
+# ===========================================================================
+
+@st.cache_data(ttl=TTL["prices"], show_spinner=False)
+def cached_get_prices() -> dict:
+    try:
+        return _get_prices_raw()
+    except Exception as exc:
+        logger.error("get_prices() exception: %s", exc)
+        return {"as_of_utc": fmt_iso_utc(now_utc()), "prices": {}, "_error": str(exc)}
 
 
-def _match_indicator(event_name: str) -> dict | None:
-    """Cari mapping yang cocok dgn nama event (case-insensitive substring).
-    Urutan penting: 'core cpi m/m' dicek sebelum 'cpi m/m'."""
-    n = (event_name or "").lower()
-    for spec in US_INDICATOR_MAP:
-        if spec["match"] in n and not any(x in n for x in spec.get("exclude", [])):
-            return spec
-    return None
+@st.cache_data(ttl=TTL["macro"], show_spinner=False)
+def cached_get_macro(calendar_events_json: str) -> dict:
+    """calendar_events_json: json-encoded list agar st.cache_data bisa hash."""
+    import json
+    try:
+        cal_events = json.loads(calendar_events_json) if calendar_events_json else []
+        return _get_macro_raw(calendar_events=cal_events)
+    except Exception as exc:
+        logger.error("get_macro() exception: %s", exc)
+        return {
+            "as_of_utc": fmt_iso_utc(now_utc()),
+            "rates": {}, "rate_diff": {}, "surprises": {},
+            "_meta": {"sources_ok": [], "sources_failed": [f"macro error: {exc}"]},
+            "_error": str(exc),
+        }
 
 
-def _fetch_fred_series(series_id: str, api_key: str, session: requests.Session,
-                       n: int = _N_OBS) -> list[float]:
-    """Ambil n observasi TERBARU (desc) dari FRED → list float (lewati '.').
-    Return [] kalau gagal (graceful)."""
-    params = {
-        "series_id": series_id, "api_key": api_key, "file_type": "json",
-        "sort_order": "desc", "limit": n, "observation_start": "2015-01-01",
+@st.cache_data(ttl=TTL["cot"], show_spinner=False)
+def cached_get_cot() -> dict:
+    try:
+        return _get_cot_raw()
+    except Exception as exc:
+        logger.error("get_cot() exception: %s", exc)
+        return {
+            "as_of_tuesday": "N/A", "released": "N/A", "days_since_snapshot": 99,
+            "cot": {},
+            "_meta": {"source": "CFTC TFF", "weeks_history": 0,
+                      "assets_ok": [], "assets_missing": [], "stale": True},
+            "_error": str(exc),
+        }
+
+
+@st.cache_data(ttl=TTL["retail"], show_spinner=False)
+def cached_get_retail() -> dict:
+    try:
+        return _get_retail_raw()
+    except Exception as exc:
+        logger.error("get_retail() exception: %s", exc)
+        return {
+            "as_of_utc": fmt_iso_utc(now_utc()),
+            "sources_ok": [], "sources_failed": ["all"], "retail": {},
+            "_error": str(exc),
+        }
+
+
+@st.cache_data(ttl=TTL["news"], show_spinner=False)
+def cached_get_news() -> dict:
+    try:
+        return _get_news_raw()
+    except Exception as exc:
+        logger.error("get_news() exception: %s", exc)
+        return {
+            "as_of_utc": fmt_iso_utc(now_utc()),
+            "headlines": [], "_error": str(exc),
+        }
+
+
+@st.cache_data(ttl=TTL["calendar"], show_spinner=False)
+def cached_enrich_world(events_json: str) -> dict:
+    """Isi actual non-US dari DBnomics (gratis, tanpa key). Cached. Graceful."""
+    import json
+    try:
+        events = json.loads(events_json) if events_json else []
+        return _enrich_world_raw(events)
+    except Exception as exc:
+        logger.error("enrich_world_actuals() exception: %s", exc)
+        import json as _j
+        return {"events": _j.loads(events_json) if events_json else [], "enriched": [], "_meta": {"error": str(exc)}}
+
+
+@st.cache_data(ttl=TTL["calendar"], show_spinner=False)
+def cached_enrich_fmp(events_json: str) -> dict:
+    """Isi actual (DISPLAY-only) dari FMP utk event yg belum punya actual. Cached.
+    Tanpa FMP_API_KEY / gagal → events apa adanya."""
+    import json
+    try:
+        events = json.loads(events_json) if events_json else []
+        return _enrich_fmp_raw(events)
+    except Exception as exc:
+        logger.error("enrich_actuals_fmp() exception: %s", exc)
+        import json as _j
+        return {"events": _j.loads(events_json) if events_json else [], "enriched": [], "_meta": {"error": str(exc)}}
+
+
+@st.cache_data(ttl=TTL["calendar"], show_spinner=False)
+def cached_enrich_us(events_json: str) -> dict:
+    """Isi actual event US dari FRED (cached). Terima json string utk hashability.
+    Graceful: gagal → kembalikan events apa adanya (tanpa actual)."""
+    import json
+    try:
+        events = json.loads(events_json) if events_json else []
+        return _enrich_us_raw(events)
+    except Exception as exc:
+        logger.error("enrich_us_actuals() exception: %s", exc)
+        import json as _j
+        return {"events": _j.loads(events_json) if events_json else [], "enriched": [], "_meta": {"error": str(exc)}}
+
+
+@st.cache_data(ttl=TTL["calendar"], show_spinner=False)
+def cached_get_calendar() -> dict:
+    try:
+        return _get_calendar_raw()
+    except Exception as exc:
+        logger.error("get_calendar() exception: %s", exc)
+        return {
+            "as_of_utc": fmt_iso_utc(now_utc()),
+            "events": [], "_error": str(exc),
+        }
+
+
+@st.cache_data(ttl=TTL["news_overlay"], show_spinner=False)
+def cached_compute_news_delta(headlines_json: str) -> tuple[dict, list]:
+    """Cache news_overlay (proses mahal). Terima json string utk hashability."""
+    import json
+    try:
+        headlines = json.loads(headlines_json) if headlines_json else []
+        return compute_news_delta(headlines)
+    except Exception as exc:
+        logger.error("compute_news_delta() exception: %s", exc)
+        return {}, []
+
+
+# ===========================================================================
+# HELPERS DISPLAY
+# ===========================================================================
+
+def _bias_color(score: float) -> str:
+    """Return hex color untuk skor bias."""
+    if score >= 25:
+        return "#16a34a"   # hijau
+    elif score <= -25:
+        return "#dc2626"   # merah
+    return "#6b7280"       # abu netral
+
+
+def _bias_bar_html(score: float, width_px: int = 180) -> str:
+    """Render bias bar HTML dari -100 ke +100."""
+    pct_abs = min(abs(score), 100) / 100.0
+    color = _bias_color(score)
+    bar_pct = pct_abs * 50   # 50% = separuh bar (dari tengah)
+    if score >= 0:
+        left = 50
+        bar_width = bar_pct
+    else:
+        bar_width = bar_pct
+        left = 50 - bar_pct
+    return (
+        f'<div style="position:relative;width:{width_px}px;height:14px;'
+        f'background:#e5e7eb;border-radius:4px;">'
+        f'<div style="position:absolute;left:50%;top:0;width:1px;height:14px;background:#9ca3af;"></div>'
+        f'<div style="position:absolute;left:{left:.1f}%;width:{bar_width:.1f}%;height:14px;'
+        f'background:{color};border-radius:3px;"></div>'
+        f'</div>'
+    )
+
+
+def _label_html(label: str) -> str:
+    css_map = {
+        "Strong Bullish": "label-sbull",
+        "Bullish": "label-bull",
+        "Neutral": "label-neut",
+        "Bearish": "label-bear",
+        "Strong Bearish": "label-sbear",
     }
-    attempt = 0
-    while attempt <= _FRED_RETRIES:
-        try:
-            resp = session.get(_FRED_BASE_URL, params=params, timeout=_FRED_TIMEOUT)
-            resp.raise_for_status()
-            obs = resp.json().get("observations", [])
-            vals = [float(o["value"]) for o in obs if o.get("value", ".") != "."]
-            return vals  # urut desc (terbaru dulu)
-        except requests.exceptions.HTTPError as exc:
-            code = getattr(exc.response, "status_code", None)
-            if code == 429:
-                time.sleep(2.0); attempt += 1; continue
-            logger.warning("FRED %s HTTP %s", series_id, code); return []
-        except Exception as exc:
-            logger.warning("FRED %s gagal: %s", series_id, exc)
-            attempt += 1
-            if attempt <= _FRED_RETRIES:
-                time.sleep(1.5)
-    return []
+    css = css_map.get(label, "label-neut")
+    return f'<span class="{css}">{label}</span>'
 
 
-def implied_previous(vals: list[float], transform: str, scale: float) -> float | None:
-    """Nilai periode SEBELUMNYA dalam metrik kalender (untuk validasi alignment).
-    Bandingkan ini dgn `previous` kalender: kalau jauh beda → seri/timing tak cocok."""
-    try:
-        if transform == "level":
-            return vals[1] * scale if len(vals) >= 2 else None
-        if transform == "mom_pct":
-            return round(((vals[2] and (vals[1] / vals[2] - 1.0) * 100.0)), 4) if len(vals) >= 3 and vals[2] else None
-        if transform == "diff":
-            return (vals[1] - vals[2]) * scale if len(vals) >= 3 else None
-    except (ZeroDivisionError, TypeError, ValueError, IndexError):
-        return None
-    return None
+def _impact_badge(impact: str) -> str:
+    cls = {"HIGH": "impact-high", "MED": "impact-med", "LOW": "impact-low"}.get(impact, "impact-low")
+    return f'<span class="{cls}">{impact}</span>'
 
 
-def previous_aligned(vals: list[float], transform: str, scale: float, cal_previous) -> bool:
-    """True jika previous DBnomics/FRED cocok dgn `previous` kalender (toleransi relatif).
-    Kalau `cal_previous` tidak ada → True (tak bisa divalidasi, jangan blokir)."""
-    if cal_previous is None:
-        return True
-    try:
-        cp = float(cal_previous)
-    except (TypeError, ValueError):
-        return True
-    ip = implied_previous(vals, transform, scale)
-    if ip is None:
-        return True  # tak cukup data utk validasi → jangan blokir
-    tol = max(abs(cp) * 0.05, 0.1)
-    return abs(ip - cp) <= tol
+def _dir_html(sign: str) -> str:
+    if sign == "+":
+        return '<span class="dir-plus">▲</span>'
+    elif sign == "-":
+        return '<span class="dir-minus">▼</span>'
+    return '<span class="dir-zero">—</span>'
 
 
-def compute_actual_and_sigma(vals: list[float], transform: str, scale: float) -> tuple[float | None, float | None]:
-    """Dari deret FRED (desc, terbaru dulu) → (actual, σ) dalam unit kalender.
+def _conf_bar(conf: float) -> str:
+    """Confidence bar kecil sebagai pct string."""
+    pct = round(conf * 100)
+    col = "#15803d" if pct >= 60 else "#d97706" if pct >= 35 else "#dc2626"
+    return (
+        f'<span style="font-size:0.75rem;color:{col};font-weight:600;">'
+        f'{pct}%</span>'
+    )
 
-    σ = volatilitas rilis historis (proxy, PLACEHOLDER). Return (None,None) bila data kurang.
-    """
-    if not vals or len(vals) < 3:
-        return None, None
-    try:
-        if transform == "level":
-            actual = vals[0] * scale
-            diffs = [(vals[i] - vals[i + 1]) * scale for i in range(len(vals) - 1)]
-            sigma = statistics.pstdev(diffs) if len(diffs) >= 2 else None
-        elif transform == "mom_pct":
-            moms = [((vals[i] / vals[i + 1]) - 1.0) * 100.0 for i in range(len(vals) - 1) if vals[i + 1]]
-            if not moms:
-                return None, None
-            actual = round(moms[0], 4)
-            sigma = statistics.pstdev(moms) if len(moms) >= 2 else None
-        elif transform == "diff":
-            diffs = [(vals[i] - vals[i + 1]) * scale for i in range(len(vals) - 1)]
-            if not diffs:
-                return None, None
-            actual = round(diffs[0], 2)
-            sigma = statistics.pstdev(diffs) if len(diffs) >= 2 else None
+
+# ===========================================================================
+# SECTION 1 — HEADER
+# ===========================================================================
+
+def render_header(sources_status: dict[str, Any]) -> None:
+    """Render judul, timestamp, status sumber, tombol Refresh."""
+    ts_utc = now_utc()
+    ts_wib = now_wib()
+
+    col_title, col_ts, col_btn = st.columns([3, 4, 1.2])
+
+    with col_title:
+        st.markdown("## 📊 QF_BIAS Dashboard")
+
+    with col_ts:
+        st.markdown(
+            f"**UTC:** `{fmt_iso_utc(ts_utc)}`  \n"
+            f"**WIB:** `{fmt_wib_display(ts_wib)} WIB`",
+        )
+
+    with col_btn:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 Refresh", help="Bersihkan cache & muat ulang semua data"):
+            clear_all_caches()
+            st.rerun()
+
+    # --- Status sumber ---
+    if sources_status:
+        badge_parts = []
+        for src, status in sources_status.items():
+            if src.startswith("_"):   # _cot_note dll → bukan badge
+                continue
+            if status == "ok":
+                badge_parts.append(f'<span class="badge-ok">✓ {src}</span>')
+            elif status == "warn":
+                badge_parts.append(f'<span class="badge-warn">⚠ {src}</span>')
+            else:
+                badge_parts.append(f'<span class="badge-fail">✗ {src}</span>')
+        st.markdown(
+            "<div style='display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;'>"
+            + " ".join(badge_parts)
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+        cot_note = sources_status.get("_cot_note")
+        if cot_note:
+            st.caption(f"ℹ️ {cot_note}")
+
+    st.divider()
+
+
+# ===========================================================================
+# SECTION 4a — BIAS BOARD
+# ===========================================================================
+
+def render_bias_board(
+    asset_data: dict[str, dict],
+    news_delta: dict[str, float],
+    show_overlay: bool,
+) -> None:
+    """Render grid kartu per aset dengan bar skor, label, confidence, driver breakdown."""
+
+    st.subheader("📈 Bias Board")
+
+    if not asset_data:
+        st.warning("Data bias aset kosong — periksa collectors.")
+        return
+
+    # Kelompokkan: FX, XAU, Crypto
+    groups = [
+        ("FX Majors", ASSETS_FX),
+        ("Commodities", [ASSET_GOLD]),
+        ("Crypto", ASSETS_CRYPTO),
+    ]
+
+    for group_name, group_assets in groups:
+        st.markdown(f"**{group_name}**")
+        cols = st.columns(len(group_assets))
+
+        for col, asset in zip(cols, group_assets):
+            data = asset_data.get(asset)
+            if data is None:
+                col.warning(f"{asset}: no data")
+                continue
+
+            baseline = data.get("bias_baseline", 0.0)
+            delta = news_delta.get(asset, 0.0)
+
+            if show_overlay:
+                score = max(-100.0, min(100.0, baseline + delta))
+                label_suffix = " ★"  # indikasi overlay aktif
+            else:
+                score = baseline
+                label_suffix = ""
+
+            label = bias_label(score)
+            conf = data.get("confidence", 0.0) or 0.0
+            drivers = data.get("drivers", {})
+
+            with col:
+                with st.container():
+                    # Header kartu
+                    st.markdown(
+                        f"<div style='font-weight:700;font-size:1.05rem;'>{asset}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    # Skor
+                    sign = "+" if score >= 0 else ""
+                    st.markdown(
+                        f"<div style='font-size:1.4rem;font-weight:700;"
+                        f"color:{_bias_color(score)};'>{sign}{score:.1f}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    # Bar
+                    st.markdown(_bias_bar_html(score, width_px=140), unsafe_allow_html=True)
+
+                    # Label + confidence
+                    st.markdown(
+                        f"{_label_html(label + label_suffix)} &nbsp; {_conf_bar(conf)}",
+                        unsafe_allow_html=True,
+                    )
+
+                    # News delta (kalau aktif & ada)
+                    if show_overlay and abs(delta) > 0.1:
+                        delta_str = f"+{delta:.1f}" if delta >= 0 else f"{delta:.1f}"
+                        col_nd = "#16a34a" if delta >= 0 else "#dc2626"
+                        st.markdown(
+                            f"<div style='font-size:0.72rem;color:{col_nd};'>Δnews: {delta_str}</div>",
+                            unsafe_allow_html=True,
+                        )
+
+                    # Driver breakdown (expander)
+                    if drivers:
+                        with st.expander("📋 Drivers", expanded=False):
+                            for factor, fdata in drivers.items():
+                                fscore = fdata.get("score", 0.0)
+                                fweight = fdata.get("weight", 0.0)
+                                fdetail = fdata.get("detail", "–")
+                                fcol = _bias_color(fscore * 100)
+                                st.markdown(
+                                    f"<div style='font-size:0.78rem;margin-bottom:4px;'>"
+                                    f"<span style='font-weight:600;'>{factor}</span> "
+                                    f"<span style='color:{fcol};font-weight:700;'>{fscore:+.3f}</span> "
+                                    f"<span style='color:#6b7280;'>(w={fweight:.2f})</span><br>"
+                                    f"<span style='color:#374151;'>{fdetail}</span>"
+                                    f"</div>",
+                                    unsafe_allow_html=True,
+                                )
+                    else:
+                        st.caption("–")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+
+# ===========================================================================
+# SECTION 4b — PAIR SCANNER
+# ===========================================================================
+
+def render_pair_scanner(
+    pair_data: dict[str, dict],
+    asset_data: dict[str, dict],
+    show_overlay: bool,
+    news_delta: dict[str, float],
+) -> None:
+    """Render Pair Scanner: selectbox base/quote + tabel ranking pair terkuat."""
+
+    st.subheader("🔍 Pair Scanner")
+
+    if not pair_data:
+        st.warning("Data pair kosong — periksa engine/scoring.")
+        return
+
+    all_assets = list(ASSETS_FX) + [ASSET_GOLD] + list(ASSETS_CRYPTO)
+    col_b, col_q = st.columns(2)
+    with col_b:
+        sel_base = st.selectbox("Base Currency", options=all_assets, index=0, key="ps_base")
+    with col_q:
+        sel_quote = st.selectbox("Quote Currency", options=all_assets, index=1, key="ps_quote")
+
+    # Panel info dirender SETELAH kedua selectbox terbaca (hindari stale value).
+    info_box = st.container()
+    with info_box:
+        if sel_base == sel_quote:
+            st.warning("Base dan quote tidak boleh sama.")
         else:
-            return None, None
-    except (ZeroDivisionError, statistics.StatisticsError, ValueError):
-        return None, None
-    if sigma is not None and abs(sigma) < 1e-9:
-        sigma = None
-    return actual, (round(sigma, 6) if sigma is not None else None)
+            # Cari pair symbol yang cocok
+            pair_sym = f"{sel_base}{sel_quote}"
+            pair_rev = f"{sel_quote}{sel_base}"
+
+            pair_found = pair_data.get(pair_sym) or pair_data.get(pair_rev)
+            actual_sym = pair_sym if pair_data.get(pair_sym) else pair_rev
+
+            if pair_found:
+                p = pair_found
+                score = p.get("bias_score", 0.0)
+
+                # Kalau overlay aktif, recalculate pair bias langsung
+                if show_overlay:
+                    base = p.get("base", sel_base)
+                    quote = p.get("quote", sel_quote)
+                    base_score = (asset_data.get(base, {}).get("bias_baseline", 0.0)
+                                  + news_delta.get(base, 0.0))
+                    quote_score = (asset_data.get(quote, {}).get("bias_baseline", 0.0)
+                                   + news_delta.get(quote, 0.0))
+                    score = max(-100.0, min(100.0, base_score - quote_score))
+
+                label = bias_label(score)
+                conf = p.get("confidence", None)
+                note = p.get("note", "")
+
+                sign_str = "+" if score >= 0 else ""
+                st.markdown(
+                    f"<div style='font-size:1.1rem;font-weight:700;'>{actual_sym}</div>"
+                    f"<div style='font-size:2rem;font-weight:700;color:{_bias_color(score)};'>"
+                    f"{sign_str}{score:.1f}</div>"
+                    f"{_label_html(label)}&nbsp;",
+                    unsafe_allow_html=True,
+                )
+
+                if conf is not None:
+                    st.markdown(f"**Confidence:** {_conf_bar(conf)}", unsafe_allow_html=True)
+
+                st.markdown(_bias_bar_html(score, width_px=220), unsafe_allow_html=True)
+
+                if note:
+                    st.caption(f"_{note}_")
+            else:
+                # Hitung manual dari asset bias
+                base_data = asset_data.get(sel_base)
+                quote_data = asset_data.get(sel_quote)
+                if base_data is not None and quote_data is not None:
+                    base_b = base_data.get("bias_baseline", 0.0)
+                    quote_b = quote_data.get("bias_baseline", 0.0)
+                    if show_overlay:
+                        base_b += news_delta.get(sel_base, 0.0)
+                        quote_b += news_delta.get(sel_quote, 0.0)
+                    score = max(-100.0, min(100.0, base_b - quote_b))
+                    label = bias_label(score)
+                    sign_str = "+" if score >= 0 else ""
+                    st.markdown(
+                        f"<div style='font-size:1.1rem;font-weight:700;'>"
+                        f"{sel_base}/{sel_quote} <span style='font-size:0.75rem;color:#9ca3af;'>(custom)</span></div>"
+                        f"<div style='font-size:2rem;font-weight:700;color:{_bias_color(score)};'>"
+                        f"{sign_str}{score:.1f}</div>"
+                        f"{_label_html(label)}",
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(_bias_bar_html(score, width_px=220), unsafe_allow_html=True)
+                    st.caption(f"Dihitung manual: {sel_base}({base_b:.1f}) − {sel_quote}({quote_b:.1f})")
+                else:
+                    st.info(f"Pair {pair_sym} tidak ada di data terkomputasi.")
+
+    # --- Ranking tabel pair terkuat ---
+    st.markdown("**📊 Ranking Pair (sort |bias|)**")
+    try:
+        # Kalau overlay, rebuild pair dengan overlay score
+        if show_overlay:
+            overlay_asset_map: dict[str, dict] = {}
+            for asset, adata in asset_data.items():
+                baseline = adata.get("bias_baseline", 0.0)
+                overlaid = max(-100.0, min(100.0, baseline + news_delta.get(asset, 0.0)))
+                overlay_asset_map[asset] = {**adata, "bias_baseline": overlaid}
+            ranking_pairs = compute_pairs(overlay_asset_map)
+        else:
+            ranking_pairs = pair_data
+
+        ranked = rank_pairs(ranking_pairs, top_n=len(PAIRS))
+
+        if ranked:
+            tbl_data = []
+            for r in ranked:
+                score_r = r.get("bias_score", 0.0)
+                conf_r = r.get("confidence")
+                conf_str = f"{conf_r*100:.0f}%" if conf_r is not None else "–"
+                tbl_data.append({
+                    "Pair": r["pair"],
+                    "Score": f"{'+' if score_r>=0 else ''}{score_r:.1f}",
+                    "Label": r.get("label", bias_label(score_r)),
+                    "Conf": conf_str,
+                    "Kalkulasi": r.get("note", ""),
+                })
+            import pandas as pd
+            df = pd.DataFrame(tbl_data)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Tidak ada pair yang bisa di-rank.")
+    except Exception as exc:
+        st.warning(f"Ranking pair gagal: {exc}")
 
 
-def enrich_us_actuals(events: list[dict], api_key: str | None = None) -> dict:
-    """Isi `actual` + `historical_std` + `surprise_polarity` untuk event US yang
-    sudah RELEASED & cocok mapping. Event lain tidak disentuh.
+# ===========================================================================
+# SECTION 4c — NEWS FEED
+# ===========================================================================
 
-    Returns: {"events": events(diperkaya), "enriched": [list nama], "_meta": {...}}
-    Tidak pernah raise. Gagal per-seri = event itu tetap actual=None (aman).
+def render_news_feed(
+    news_clusters: list[dict],
+    news_delta_map: dict[str, float] | None = None,
+    news_meta: dict | None = None,
+) -> None:
+    """Render news clusters (sudah dedup) dari engine/news_overlay.
+
+    news_delta_map : net Δ per aset (untuk ringkasan di atas feed).
+    news_meta       : dict hasil get_news (untuk status sumber: ok/gagal).
     """
-    api_key = api_key or _get_fred_key()
-    enriched: list[str] = []
-    mismatched: list[str] = []
-    if not api_key:
-        return {"events": events, "enriched": [], "_meta": {"error": "FRED_API_KEY tidak ada"}}
+    news_delta_map = news_delta_map or {}
+    news_meta = news_meta or {}
 
-    # Hanya proses event US, status released, actual masih kosong → hemat kuota FRED.
-    targets = [e for e in events
-               if e.get("currency") == "USD"
-               and e.get("status") == "released"
-               and e.get("actual") is None
-               and _match_indicator(e.get("name", "")) is not None]
-    if not targets:
-        return {"events": events, "enriched": [], "_meta": {"note": "tidak ada event US released yang cocok mapping"}}
+    hcol, rcol = st.columns([5, 1])
+    with hcol:
+        st.subheader("📰 News Feed (Sudah Keluar)")
+    with rcol:
+        if st.button("🔄 Refresh", key="refresh_news", help="Muat ulang berita terbaru", use_container_width=True):
+            clear_all_caches()
+            st.rerun()
 
-    # Cache seri agar tidak fetch dua kali untuk indikator sama.
-    series_cache: dict[str, list[float]] = {}
-    session = requests.Session()
-    fetched = 0
-    for ev in targets:
-        spec = _match_indicator(ev.get("name", ""))
-        sid = spec["series"]
-        if sid not in series_cache:
-            series_cache[sid] = _fetch_fred_series(sid, api_key, session)
-            fetched += 1
-            time.sleep(_THROTTLE_S)
-        actual, sigma = compute_actual_and_sigma(series_cache[sid], spec["transform"], spec["scale"])
-        if actual is None:
+    # --- Status sumber (mana yang hidup / gagal) — tutup celah "error ditelan" ---
+    ok = news_meta.get("sources_ok", [])
+    failed = news_meta.get("sources_failed", [])
+    if ok or failed:
+        parts = []
+        if ok:
+            parts.append("✅ aktif: " + ", ".join(ok))
+        if failed:
+            parts.append("✗ gagal: " + ", ".join(failed))
+        st.caption(" &nbsp;·&nbsp; ".join(parts))
+    if news_meta.get("error") and not news_clusters:
+        st.warning(f"Semua feed news gagal: {news_meta['error']}")
+
+    if not news_clusters:
+        st.info("Tidak ada news cluster saat ini — feed kosong atau semua event sudah decay.")
+        return
+
+    # --- Ringkasan net news Δ per aset (TAMBAHAN b) ---
+    nz_delta = {a: v for a, v in news_delta_map.items() if abs(v) >= 0.05}
+    if nz_delta:
+        chips = []
+        for a, v in sorted(nz_delta.items(), key=lambda kv: -abs(kv[1])):
+            col = "#16a34a" if v > 0 else "#dc2626"
+            chips.append(
+                f"<span style='background:#111827;border:1px solid {col};color:{col};"
+                f"padding:2px 8px;border-radius:10px;font-size:0.78rem;font-weight:700;'>"
+                f"{a} {v:+.1f}</span>"
+            )
+        st.markdown(
+            "<div style='font-size:0.72rem;color:#6b7280;text-transform:uppercase;"
+            "letter-spacing:0.04em;margin-bottom:4px;'>Net News Δ (cap ±30, placeholder)</div>"
+            "<div style='display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;'>"
+            + " ".join(chips) + "</div>",
+            unsafe_allow_html=True,
+        )
+
+    # --- Kontrol: filter aset, sembunyikan netral, sort (TAMBAHAN a + c) ---
+    avail_assets = sorted({
+        a for c in news_clusters
+        for a, v in c.get("direction", {}).items() if v != "0"
+    })
+    f1, f2, f3 = st.columns([2.2, 1.4, 1.4])
+    with f1:
+        asset_filter = st.multiselect(
+            "Filter aset", options=avail_assets, default=[],
+            key="nf_asset", help="Kosong = semua. Hanya tampilkan cluster yang menyentuh aset terpilih.",
+        )
+    with f2:
+        hide_neutral = st.toggle(
+            "Sembunyikan netral", value=True, key="nf_hideneutral",
+            help="Sembunyikan cluster tanpa reaksi aset (–) — buang noise.",
+        )
+    with f3:
+        sort_mode = st.selectbox(
+            "Urutkan", options=["Terbaru", "Magnitude"], index=0, key="nf_sort",
+        )
+
+    # --- Terapkan filter ---
+    filtered = []
+    for c in news_clusters:
+        reactions = {a: v for a, v in c.get("direction", {}).items() if v != "0"}
+        if hide_neutral and not reactions:
             continue
-        # GUARD alignment: previous DBnomics/FRED harus cocok previous kalender,
-        # kalau tidak → seri/timing salah → JANGAN isi (cegah actual keliru masuk skor).
-        if not previous_aligned(series_cache[sid], spec["transform"], spec["scale"], ev.get("previous")):
-            mismatched.append(f"{ev.get('name','?')} (FRED:{sid})")
+        if asset_filter and not any(a in reactions for a in asset_filter):
             continue
-        ev["actual"] = actual
-        ev["historical_std"] = sigma                  # bisa None → build_surprises fallback ke raw delta
-        ev["surprise_polarity"] = float(spec["polarity"])
-        ev["actual_source"] = f"FRED:{sid}"
-        enriched.append(ev.get("name", sid))
+        filtered.append(c)
 
-    return {
-        "events": events,
-        "enriched": enriched,
-        "_meta": {"series_fetched": fetched, "matched": len(targets), "mismatched": mismatched},
-    }
+    if not filtered:
+        st.info("Tidak ada cluster yang lolos filter saat ini.")
+        return
+
+    # --- Terapkan sort ---
+    if sort_mode == "Magnitude":
+        sorted_clusters = sorted(filtered, key=lambda c: c.get("magnitude", 0.0), reverse=True)
+    else:
+        sorted_clusters = sorted(filtered, key=lambda c: c.get("age_min", 9999))
+
+    st.caption(f"Menampilkan {len(sorted_clusters)} dari {len(news_clusters)} cluster")
+
+    for cluster in sorted_clusters:
+        event_title = cluster.get("event", "–")
+        n_hl = cluster.get("n_headlines", 1)
+        age = cluster.get("age_min", 0.0)
+        direction = cluster.get("direction", {})
+        mag = cluster.get("magnitude", 0.0)
+
+        # Format umur
+        if age < 1:
+            age_str = "baru saja"
+        elif age < 60:
+            age_str = f"{int(age)}m lalu"
+        else:
+            h = int(age // 60)
+            m = int(age % 60)
+            age_str = f"{h}j {m}m lalu" if m else f"{h}j lalu"
+
+        # Reaksi aset yang non-zero
+        reactions = {a: v for a, v in direction.items() if v != "0"}
+
+        link = cluster.get("link", "")
+
+        with st.container():
+            col_event, col_meta, col_react, col_act = st.columns([3.6, 1.4, 2.2, 1.4])
+
+            with col_event:
+                # Judul + link "Buka" kalau ada
+                if link:
+                    st.markdown(
+                        f"<div style='font-weight:600;font-size:0.9rem;'>{event_title} "
+                        f"<a href='{link}' target='_blank' style='font-size:0.72rem;color:#60a5fa;text-decoration:none;'>🔗 buka</a></div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f"<div style='font-weight:600;font-size:0.9rem;'>{event_title}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+            with col_meta:
+                st.markdown(
+                    f"<div style='font-size:0.78rem;color:#6b7280;'>"
+                    f"📰 {n_hl} hl &nbsp;|&nbsp; ⏱ {age_str}<br>"
+                    f"mag: {mag:.2f}</div>",
+                    unsafe_allow_html=True,
+                )
+
+            with col_react:
+                if reactions:
+                    react_parts = []
+                    for asset, sign in sorted(reactions.items()):
+                        react_parts.append(f"{asset}{_dir_html(sign)}")
+                    st.markdown(
+                        "<div style='font-size:0.82rem;display:flex;gap:6px;flex-wrap:wrap;'>"
+                        + " ".join(react_parts)
+                        + "</div>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        "<span style='color:#9ca3af;font-size:0.78rem;'>–</span>",
+                        unsafe_allow_html=True,
+                    )
+
+            with col_act:
+                # Placeholder tombol Groq AI — aktif di sesi integrasi Groq berikutnya.
+                # Saat ini menampilkan tombol disabled + caption, supaya slot UI sudah siap.
+                st.button(
+                    "🤖 Groq context",
+                    key=f"groq_{abs(hash(event_title))%10**8}",
+                    disabled=True,
+                    help="Analisis konteks AI (Groq) — diaktifkan di update berikutnya. "
+                         "Akan menilai: kekuatan currency saat ini, dampak news ke trader, "
+                         "potensi sentimen, lalu memberi weighting terukur (engine yang hitung).",
+                    use_container_width=True,
+                )
+
+            st.markdown(
+                "<hr style='border:none;border-top:1px solid #1f2937;margin:4px 0;'>",
+                unsafe_allow_html=True,
+            )
+
+
+# ===========================================================================
+# SECTION 4d — KEY RISK EVENTS
+# ===========================================================================
+
+def render_key_risk_events(calendar_data: dict) -> None:
+    """Risk events 3 mode: Hari Ini (07:00 WIB cycle), Minggu Ini (Sen-Min + filter hari),
+    Historis (2 minggu ke belakang dgn aktual). + tombol refresh lokal."""
+
+    from datetime import timedelta
+
+    hcol, rcol = st.columns([5, 1])
+    with hcol:
+        st.subheader("⏰ Key Risk Events")
+    with rcol:
+        if st.button("🔄 Refresh", key="refresh_risk", help="Muat ulang kalendar", use_container_width=True):
+            clear_all_caches()
+            st.rerun()
+
+    events = calendar_data.get("events", [])
+    _us_enr = calendar_data.get("_us_enriched", [])
+    _us_meta = calendar_data.get("_us_meta", {})
+    _fmp_enr = calendar_data.get("_fmp_enriched", [])
+    _fmp_meta = calendar_data.get("_fmp_meta", {})
+    _world_enr = calendar_data.get("_world_enriched", [])
+    _world_meta = calendar_data.get("_world_meta", {})
+    # Status enrichment SELALU tampil (jangan biarkan user menebak kenapa actual kosong)
+    _bits = []
+    if _us_enr:
+        _bits.append(f"🟢 FRED US (skor): {len(_us_enr)} → {', '.join(_us_enr[:5])}" + (" …" if len(_us_enr) > 5 else ""))
+    elif _us_meta.get("error"):
+        _bits.append(f"⚠ FRED gagal: {_us_meta['error']}")
+    else:
+        _bits.append("⚪ FRED US: 0 event ber-mapping yang rilis di window ini")
+    if _us_meta.get("mismatched"):
+        _bits.append(f"🟡 FRED US misaligned (ditolak, previous≠kalender): {', '.join(_us_meta['mismatched'][:4])}")
+    if _world_enr:
+        _bits.append(f"🟢 DBnomics non-US (skor): {len(_world_enr)} → {', '.join(_world_enr[:5])}" + (" …" if len(_world_enr) > 5 else ""))
+    if _world_meta.get("mismatched"):
+        _bits.append(f"🟡 DBnomics misaligned (ditolak, previous≠kalender): {', '.join(_world_meta['mismatched'][:4])}")
+    if _world_meta.get("failed_series"):
+        _bits.append(f"⚠ DBnomics seri gagal resolve: {', '.join(_world_meta['failed_series'])} (cek kode di browser)")
+    if _fmp_enr:
+        _bits.append(f"🔵 FMP (display): {len(_fmp_enr)} → {', '.join(_fmp_enr[:5])}" + (" …" if len(_fmp_enr) > 5 else ""))
+    elif _fmp_meta.get("error"):
+        _bits.append(f"⚠ FMP gagal: {_fmp_meta['error']}")
+    elif _fmp_meta.get("note", "").startswith("FMP_API_KEY"):
+        _bits.append("⚪ FMP nonaktif (free tier FMP tak punya economic calendar)")
+    for _b in _bits:
+        st.caption(_b)
+    if calendar_data.get("_error") and not events:
+        st.warning(f"Calendar fetch gagal: {calendar_data['_error']}")
+        return
+    if not events:
+        st.info("Tidak ada event dalam window.")
+        return
+
+    now_w = now_wib()
+
+    # --- Window "Hari Ini" = 07:00 WIB hari ini → 07:00 WIB besok ---
+    today_anchor = now_w.replace(hour=7, minute=0, second=0, microsecond=0)
+    if now_w.hour < 7:
+        today_anchor = today_anchor - timedelta(days=1)  # belum jam 7 → cycle kemarin
+    today_start = today_anchor
+    today_end = today_anchor + timedelta(days=1)
+
+    # --- Window "Minggu Ini" = Senin 00:00 → Minggu 23:59 WIB ---
+    monday = (now_w - timedelta(days=now_w.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    sunday_end = monday + timedelta(days=7)
+
+    def _ev_wib(ev: dict):
+        """Parse ts_utc → WIB. Tahan-banting: tidak bergantung HANYA pada
+        parse_iso_utc (yang bisa beda versi di deploy). Kalau gagal total,
+        return None — tapi kegagalan ini DIHITUNG di diagnostik (bukan ditelan)."""
+        ts = ev.get("ts_utc")
+        if not ts:
+            return None
+        # 1) jalur normal
+        try:
+            return parse_iso_utc(ts).astimezone(now_w.tzinfo)
+        except Exception:
+            pass
+        # 2) fallback parser mandiri (Z / offset / naive / spasi)
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            s = str(ts).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            if " " in s and "T" not in s:
+                s = s.replace(" ", "T", 1)
+            d = _dt.fromisoformat(s)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=_tz.utc)
+            return d.astimezone(now_w.tzinfo)
+        except Exception:
+            return None
+
+    # ---- MODE PICKER: Last / This / Upcoming Week ----
+    mode = st.radio(
+        "Tampilan",
+        options=["📅 Hari Ini", "🗓️ Minggu Ini"],
+        horizontal=True, key="re_mode", label_visibility="collapsed",
+    )
+
+    # ---- FILTER BAR (impact + currency selalu ada) ----
+    fcol1, fcol2 = st.columns(2)
+    with fcol1:
+        impact_filter = st.multiselect(
+            "Filter Impact", options=["HIGH", "MED", "LOW"],
+            default=["HIGH", "MED"], key="re_impact",
+        )
+    with fcol2:
+        avail_ccy = sorted({e.get("currency", "?") for e in events if e.get("currency")})
+        ccy_filter = st.multiselect(
+            "Filter Currency", options=avail_ccy, default=[], key="re_ccy",
+            help="Kosong = semua.",
+        )
+
+    def _base_match(ev: dict) -> bool:
+        if impact_filter and ev.get("impact", "LOW") not in impact_filter:
+            return False
+        if ccy_filter and ev.get("currency") not in ccy_filter:
+            return False
+        return True
+
+    def _in_window(ev: dict, w_start, w_end) -> bool:
+        ew = _ev_wib(ev)
+        return ew is not None and w_start <= ew < w_end
+
+    # Tentukan window minggu sesuai mode
+    last_monday = monday - timedelta(days=7)
+    next_monday = monday + timedelta(days=7)
+    next_sunday_end = next_monday + timedelta(days=7)
+
+    day_names = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
+    day_filter = None
+    w_start = w_end = None
+    label = ""
+
+    if mode == "📅 Hari Ini":
+        w_start, w_end = today_start, today_end
+        st.caption(f"Window 07:00 WIB cycle: {today_start.strftime('%a %d %b %H:%M')} → "
+                   f"{today_end.strftime('%a %d %b %H:%M')} WIB")
+    else:  # Minggu Ini (Senin-Minggu) + filter hari
+        w_start, w_end = monday, sunday_end
+        day_choice = st.selectbox("Hari", options=["(Semua hari)"] + day_names, index=0, key="re_day")
+        if day_choice != "(Semua hari)":
+            day_filter = day_names.index(day_choice)
+        rng = f"{w_start.strftime('%d %b')} → {(w_end-timedelta(days=1)).strftime('%d %b')} WIB"
+        st.caption(rng + (f" · {day_names[day_filter]}" if day_filter is not None else ""))
+
+    subset = [e for e in events if _base_match(e) and _in_window(e, w_start, w_end)]
+    if day_filter is not None:
+        d_start = w_start + timedelta(days=day_filter)
+        d_end = d_start + timedelta(days=1)
+        subset = [e for e in subset if _in_window(e, d_start, d_end)]
+
+    # Diagnostik rinci: tunjukkan PERSIS berapa event lolos tiap tahap (akhiri tebakan)
+    n_total = len(events)
+    n_parse_fail = sum(1 for e in events if _ev_wib(e) is None)
+    n_in_window = sum(1 for e in events if _in_window(e, w_start, w_end))
+    n_impact = sum(1 for e in events if _in_window(e, w_start, w_end)
+                   and (not impact_filter or e.get("impact", "LOW") in impact_filter))
+    if not subset and events:
+        # Pecah penyebab
+        statuses = {}
+        for e in events:
+            if _in_window(e, w_start, w_end):
+                statuses[e.get("status", "?")] = statuses.get(e.get("status", "?"), 0) + 1
+        ccy_in_window = sorted({e.get("currency", "?") for e in events if _in_window(e, w_start, w_end)})
+        sample_ts = [str(e.get("ts_utc")) for e in events[:3]]
+        st.warning(
+            f"⚠ Diagnostik filter:\n\n"
+            f"- Total event ter-fetch: **{n_total}**\n"
+            f"- **Gagal parse timestamp: {n_parse_fail}** ← kalau ini = total, masalahnya FORMAT ts_utc (version skew calendar_evt/timeutils), BUKAN window\n"
+            f"- Lolos window waktu ini: **{n_in_window}** (status: {statuses})\n"
+            f"- Setelah filter impact: **{n_impact}**\n"
+            f"- Setelah filter currency: **{len(subset)}**\n\n"
+            f"Contoh ts_utc mentah: {sample_ts}\n\n"
+            f"Currency yang ADA di window: {ccy_in_window}\n\n"
+            f"**Baca:** parse-fail=total → ganti calendar_evt.py+timeutils.py (skew). "
+            f"parse-fail=0 tapi window=0 → memang tidak ada event di rentang ini. "
+            f"window>0 tapi akhir 0 → filter impact/currency ketat."
+        )
+    elif n_in_window > 0:
+        st.caption(f"📊 {n_in_window} event di window · {n_impact} lolos impact · {len(subset)} setelah currency")
+
+    upcoming = sorted([e for e in subset if e.get("status") == "upcoming"], key=lambda e: e.get("ts_utc", ""))
+    released = sorted([e for e in subset if e.get("status") == "released"], key=lambda e: e.get("ts_utc", ""), reverse=True)
+
+    def _render_row(ev: dict, is_released: bool) -> None:
+        try:
+            ts_wib_str = ev.get("ts_wib", "")
+            currency = ev.get("currency", "–")
+            impact = ev.get("impact", "LOW")
+            name = ev.get("name", "–")
+            forecast = ev.get("forecast"); previous = ev.get("previous"); actual = ev.get("actual")
+            ts_utc_str = ev.get("ts_utc", "")
+
+            if is_released:
+                cd_color = "#6b7280"; countdown = "selesai"
+            else:
+                mins = minutes_until(ts_utc_str) if ts_utc_str else None
+                countdown = countdown_str(ts_utc_str) if ts_utc_str else "–"
+                cd_color = "#ef4444" if (mins is not None and mins <= 15) else ("#d97706" if (mins is not None and mins <= 60) else "#6b7280")
+
+            col_time, col_impact, col_ccy, col_name, col_a, col_f, col_p = st.columns([1.6, 0.9, 0.7, 2.4, 1.1, 1.1, 1.1])
+            with col_time:
+                st.markdown(f"<div style='font-weight:700;color:{cd_color};font-size:0.85rem;'>{countdown}</div>"
+                            f"<div style='font-size:0.72rem;color:#9ca3af;'>{ts_wib_str} WIB</div>", unsafe_allow_html=True)
+            with col_impact:
+                st.markdown(_impact_badge(impact), unsafe_allow_html=True)
+            with col_ccy:
+                st.markdown(f"<span style='font-weight:700;font-size:0.85rem;'>{currency}</span>", unsafe_allow_html=True)
+            with col_name:
+                st.markdown(f"<div style='font-size:0.87rem;font-weight:600;'>{name}</div>", unsafe_allow_html=True)
+                # Surprise tag: hanya untuk event yang actual-nya dari FRED + ada forecast
+                pol = ev.get("surprise_polarity")
+                if is_released and pol is not None and actual is not None and forecast is not None:
+                    try:
+                        delta = (float(actual) - float(forecast)) * float(pol)
+                        if abs(delta) < 1e-9:
+                            arrow, scol, lbl = "→", "#9ca3af", "in-line"
+                        elif delta > 0:
+                            arrow, scol, lbl = "▲", "#16a34a", f"{currency} bullish"
+                        else:
+                            arrow, scol, lbl = "▼", "#dc2626", f"{currency} bearish"
+                        src = ev.get("actual_source", "")
+                        st.markdown(
+                            f"<div style='font-size:0.7rem;color:{scol};'>{arrow} surprise → {lbl}"
+                            f"<span style='color:#6b7280;'> &nbsp;{src}</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+            def _stat(label, val, color="#e5e7eb"):
+                shown = val if val is not None else "–"
+                return (f"<div style='text-align:center;'><div style='font-size:0.62rem;color:#6b7280;"
+                        f"text-transform:uppercase;letter-spacing:0.04em;'>{label}</div>"
+                        f"<div style='font-size:1.15rem;font-weight:800;color:{color};line-height:1.2;'>{shown}</div></div>")
+            a_color = "#9ca3af"
+            if actual is not None and forecast is not None:
+                try: a_color = "#16a34a" if float(actual) >= float(forecast) else "#ef4444"
+                except (TypeError, ValueError): a_color = "#e5e7eb"
+            elif actual is not None:
+                a_color = "#e5e7eb"
+            with col_a: st.markdown(_stat("Actual", actual, a_color), unsafe_allow_html=True)
+            with col_f: st.markdown(_stat("Forecast", forecast, "#93c5fd"), unsafe_allow_html=True)
+            with col_p: st.markdown(_stat("Previous", previous, "#9ca3af"), unsafe_allow_html=True)
+            st.markdown("<hr style='border:none;border-top:1px solid #1f2937;margin:6px 0;'>", unsafe_allow_html=True)
+        except Exception as exc:
+            st.caption(f"⚠ Gagal render event: {exc}")
+
+    if mode == "🕓 Historis (2 mgg)":
+        st.markdown(f"**🕓 Sudah Lewat ({len(released)}) — dengan hasil aktual**")
+        if released:
+            for ev in released: _render_row(ev, is_released=True)
+        else:
+            st.info("Tidak ada event historis sesuai filter (atau faireconomy tidak menyediakan).")
+    else:
+        is_weekly = (mode == "🗓️ Minggu Ini")
+        st.markdown(f"**🔜 Akan Datang ({len(upcoming)})**")
+        if upcoming:
+            for ev in upcoming: _render_row(ev, is_released=False)
+        else:
+            st.info("Tidak ada upcoming event sesuai filter.")
+        if released:
+            if is_weekly:
+                # FIX "Minggu Ini tidak muncul": di tengah minggu mayoritas event
+                # sudah released → JANGAN kubur di expander tertutup. Tampilkan langsung.
+                st.markdown(f"**✅ Sudah Lewat Minggu Ini ({len(released)}) — dengan aktual**")
+                for ev in released: _render_row(ev, is_released=True)
+            else:
+                with st.expander(f"✅ Sudah lewat dalam window ini ({len(released)}) — dengan aktual"):
+                    for ev in released: _render_row(ev, is_released=True)
+
+
+def render_score_detail(
+    asset_bias_map: dict[str, dict],
+    news_delta: dict[str, float],
+) -> None:
+    """Tab Detail Skor: breakdown lengkap perhitungan bias satu currency terpilih."""
+
+    st.subheader("🔬 Detail Perhitungan Skor")
+
+    if not asset_bias_map:
+        st.warning("Data skor kosong — periksa engine.")
+        return
+
+    assets = list(asset_bias_map.keys())
+    sel = st.selectbox("Pilih mata uang / aset", options=assets, index=0, key="detail_asset")
+    data = asset_bias_map.get(sel, {})
+    drivers = data.get("drivers", {})
+    baseline = data.get("bias_baseline", 0.0)
+    nd = news_delta.get(sel, 0.0)
+    overlaid = max(-100.0, min(100.0, baseline + nd))
+    conf = data.get("confidence")
+    freshness = data.get("freshness_cot")
+    active = data.get("active_factors", [])
+
+    # --- Ringkasan atas: angka besar ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(
+            f"<div style='font-size:0.7rem;color:#6b7280;text-transform:uppercase;'>Baseline</div>"
+            f"<div style='font-size:2rem;font-weight:800;color:{_bias_color(baseline)};'>"
+            f"{'+' if baseline>=0 else ''}{baseline:.1f}</div>"
+            f"{_label_html(bias_label(baseline))}",
+            unsafe_allow_html=True)
+    with c2:
+        st.markdown(
+            f"<div style='font-size:0.7rem;color:#6b7280;text-transform:uppercase;'>+ News Δ</div>"
+            f"<div style='font-size:2rem;font-weight:800;color:{_bias_color(nd)};'>"
+            f"{'+' if nd>=0 else ''}{nd:.1f}</div>"
+            f"<div style='font-size:0.72rem;color:#9ca3af;'>cap ±30</div>",
+            unsafe_allow_html=True)
+    with c3:
+        st.markdown(
+            f"<div style='font-size:0.7rem;color:#6b7280;text-transform:uppercase;'>= Skor Final</div>"
+            f"<div style='font-size:2rem;font-weight:800;color:{_bias_color(overlaid)};'>"
+            f"{'+' if overlaid>=0 else ''}{overlaid:.1f}</div>"
+            f"{_label_html(bias_label(overlaid))}",
+            unsafe_allow_html=True)
+
+    if conf is not None:
+        st.markdown(f"**Confidence:** {_conf_bar(conf)} &nbsp; "
+                    f"<span style='font-size:0.78rem;color:#9ca3af;'>(kesepakatan faktor aktif: "
+                    f"{', '.join(active) if active else 'tidak ada'})</span>",
+                    unsafe_allow_html=True)
+
+    st.markdown("<hr style='border:none;border-top:1px solid #1f2937;margin:10px 0;'>", unsafe_allow_html=True)
+
+    # --- Breakdown per faktor: score × weight efektif = kontribusi ---
+    st.markdown("**Kontribusi per Faktor** &nbsp; <span style='font-size:0.75rem;color:#9ca3af;'>"
+                "(baseline = Σ score×weight ÷ Σ weight aktif, lalu ×100)</span>", unsafe_allow_html=True)
+
+    rows = []
+    factor_names = {"R_hard": "R_hard (makro: rate diff + surprise)",
+                    "C": "C (COT positioning)",
+                    "D": "D (retail sentiment, kontrarian)"}
+    for fkey in ["R_hard", "C", "D"]:
+        info = drivers.get(fkey, {})
+        score = info.get("score", 0.0)
+        w_eff = info.get("weight", 0.0)
+        w_nom = info.get("weight_nominal", w_eff)
+        detail = info.get("detail", "")
+        contrib = score * w_eff
+        is_active = abs(score) > 1e-9 and w_eff > 0
+        rows.append({
+            "Faktor": factor_names.get(fkey, fkey),
+            "Score": f"{score:+.3f}",
+            "Weight efektif": f"{w_eff:.3f}" + (f" (nom {w_nom:.2f})" if abs(w_eff-w_nom)>1e-6 else ""),
+            "Kontribusi": f"{contrib:+.3f}",
+            "Status": "✅ aktif" if is_active else "⚪ gate/0",
+            "Penjelasan": detail,
+        })
+    import pandas as pd
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # --- Catatan freshness COT kalau relevan ---
+    if freshness is not None and "C" in drivers:
+        cnom = drivers["C"].get("weight_nominal", 0.25)
+        ceff = drivers["C"].get("weight", 0.0)
+        st.caption(
+            f"❄️ **Freshness COT = {freshness:.3f}** → bobot C disesuaikan: "
+            f"{cnom:.2f} × {freshness:.3f} = {ceff:.3f}. "
+            f"(COT makin lama sejak snapshot Selasa → bobotnya makin kecil, bukan skornya.)"
+        )
+
+    # --- Rumus eksplisit ---
+    with st.expander("📐 Rumus & cara baca"):
+        _rumus_lines = [
+            "- **Tiap faktor** menghasilkan *score* ∈ [−1, +1] (lihat kolom Penjelasan untuk asal angkanya).",
+            "- **Weight efektif**: R_hard & D pakai bobot nominal; **C dikali freshness COT**.",
+            "- **Kontribusi** = score × weight efektif.",
+            "- **Baseline** = (Σ kontribusi faktor aktif) ÷ (Σ weight faktor aktif) × 100. Renormalisasi ini bikin faktor yang ter-*gate* (score 0) tidak menyeret hasil.",
+            "- **Skor Final** = clamp(Baseline + News Δ, −100, +100).",
+            "- **Confidence** = seberapa sepakat arah antar faktor aktif (bukan klaim akurasi).",
+            "",
+            "⚠️ Semua bobot = **placeholder** sampai backtest. Ini alat confluence, bukan sinyal arah.",
+        ]
+        st.markdown("\n".join(_rumus_lines))
+        st.info("🤖 Penjelasan naratif via Groq AI akan ditambahkan di update berikutnya — "
+                "akan menerjemahkan breakdown ini ke bahasa biasa + konteks kekuatan currency saat itu. "
+                "(Groq mengukur/menjelaskan; angka tetap dari engine deterministik.)")
+
+
+# ===========================================================================
+# SECTION 4e — FOOTER
+# ===========================================================================
+
+def render_footer() -> None:
+    st.markdown(
+        "<div class='footer-note'>"
+        "⚠️ <b>Alat confluence, bukan sinyal arah. TA tetap primary. "
+        "Bobot belum tervalidasi (placeholder).</b><br>"
+        "Confidence = kesepakatan faktor, bukan klaim akurasi arah. "
+        "Semua bobot = placeholder sampai forward-test & backtest selesai. "
+        "Indices = ditunda v2."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ===========================================================================
+# FUNGSI UTAMA — DATA PIPELINE + LAYOUT
+# ===========================================================================
+
+def build_sources_status(
+    prices: dict,
+    macro: dict,
+    cot: dict,
+    retail: dict,
+    news: dict,
+    calendar: dict,
+) -> dict[str, str]:
+    """Bangun dict status per sumber: 'ok' | 'warn' | 'fail'."""
+    status: dict[str, str] = {}
+
+    # Prices
+    px = prices.get("prices", {})
+    ok_count = sum(1 for v in px.values() if v.get("last") is not None)
+    if prices.get("_error"):
+        status["prices"] = "fail"
+    elif ok_count < len(px) * 0.5:
+        status["prices"] = "warn"
+    else:
+        status["prices"] = "ok"
+
+    # Macro / FRED
+    macro_meta = macro.get("_meta", {})
+    macro_failed = macro_meta.get("sources_failed", [])
+    if macro.get("_error") or not macro.get("rates"):
+        status["FRED"] = "fail"
+    elif macro_failed:
+        status["FRED"] = "warn"
+    else:
+        status["FRED"] = "ok"
+
+    # COT — hijau kalau mayoritas aset dapat data; XAU missing itu normal (gold ada di
+    # laporan Disaggregated, bukan TFF), jadi BUKAN alasan kuning.
+    cot_meta = cot.get("_meta", {})
+    cot_data = cot.get("cot", {})
+    n_valid = sum(1 for v in cot_data.values() if v.get("net") is not None)
+    if n_valid == 0:
+        status["COT"] = "fail"          # benar-benar kosong
+    elif cot_meta.get("stale") and n_valid < 3:
+        status["COT"] = "warn"          # sedikit data + stale
+    else:
+        status["COT"] = "ok"            # ada data → hijau
+        xau = cot_data.get("XAU", {})
+        if xau.get("net") is None:
+            status["_cot_note"] = "XAU N/A (gold ada di laporan Disaggregated, bukan TFF — wajar, tidak mempengaruhi 9 aset lain)"
+
+    # Retail
+    retail_ok = retail.get("sources_ok", [])
+    retail_fail = retail.get("sources_failed", [])
+    if retail.get("_error") or (not retail_ok and retail_fail):
+        status["retail"] = "fail"
+    elif retail_fail:
+        status["retail"] = "warn"
+    else:
+        status["retail"] = "ok"
+
+    # News RSS
+    if news.get("_error") or not news.get("headlines"):
+        status["news"] = "fail" if news.get("_error") else "warn"
+    else:
+        status["news"] = "ok"
+
+    # Calendar
+    if calendar.get("_error") and not calendar.get("events"):
+        status["calendar"] = "fail"
+    elif calendar.get("_error"):
+        status["calendar"] = "warn"
+    else:
+        status["calendar"] = "ok"
+
+    return status
+
+
+def main() -> None:
+    """Entry point Streamlit — satu rerun = satu siklus data pipeline + display."""
+
+    # -----------------------------------------------------------------------
+    # STEP 1 — Placeholder header (timestamp dulu, sumber diisi nanti)
+    # -----------------------------------------------------------------------
+    header_placeholder = st.empty()
+
+    # -----------------------------------------------------------------------
+    # STEP 2 — Fetch collectors (semua cached TTL)
+    # -----------------------------------------------------------------------
+    with st.spinner("Memuat data pasar…"):
+        prices_data = cached_get_prices()
+
+        # Calendar dulu — diperlukan oleh macro untuk surprises
+        calendar_data = cached_get_calendar()
+
+        # Isi `actual` event US dari FRED (faireconomy tidak kasih actual).
+        import json
+        _enrich = cached_enrich_us(json.dumps(calendar_data.get("events", [])))
+        calendar_data = dict(calendar_data)                 # salinan dangkal (jangan mutasi cache)
+        calendar_data["events"] = _enrich.get("events", calendar_data.get("events", []))
+        calendar_data["_us_enriched"] = _enrich.get("enriched", [])
+        calendar_data["_us_meta"] = _enrich.get("_meta", {})
+
+        # Lapisan DBnomics (gratis, tanpa key): isi actual NON-US (EUR dulu) — IKUT skor (ber-σ).
+        _world = cached_enrich_world(json.dumps(calendar_data.get("events", [])))
+        calendar_data["events"] = _world.get("events", calendar_data.get("events", []))
+        calendar_data["_world_enriched"] = _world.get("enriched", [])
+        calendar_data["_world_meta"] = _world.get("_meta", {})
+
+        # Lapisan FMP (opsional, key-gated): isi actual sisanya (ISM dll) — DISPLAY ONLY.
+        _fmp = cached_enrich_fmp(json.dumps(calendar_data.get("events", [])))
+        calendar_data["events"] = _fmp.get("events", calendar_data.get("events", []))
+        calendar_data["_fmp_enriched"] = _fmp.get("enriched", [])
+        calendar_data["_fmp_meta"] = _fmp.get("_meta", {})
+
+        # Released events → surprises untuk macro.
+        # ATURAN DISIPLIN: HANYA event ber-σ (historical_std, dari FRED) yang menggerakkan
+        # skor. Actual dari FMP (tanpa σ) sengaja DIKECUALIKAN dari skor → display-only.
+        released_events = [
+            e for e in calendar_data.get("events", [])
+            if e.get("status") == "released"
+               and e.get("actual") is not None
+               and e.get("historical_std") is not None
+        ]
+        cal_json = json.dumps(released_events)
+        macro_data = cached_get_macro(cal_json)
+
+        cot_data = cached_get_cot()
+        retail_data = cached_get_retail()
+        news_data = cached_get_news()
+
+    # -----------------------------------------------------------------------
+    # STEP 3 — Engine
+    # -----------------------------------------------------------------------
+    with st.spinner("Menghitung bias…"):
+        # 3a. Compute all assets (baseline)
+        try:
+            asset_bias_map = compute_all_assets(
+                macro=macro_data,
+                cot=cot_data,
+                retail=retail_data,
+                prices=prices_data,
+            )
+        except Exception as exc:
+            st.error(f"compute_all_assets() gagal: {exc}")
+            asset_bias_map = {}
+
+        # 3b. Compute confidence per aset
+        for asset, adata in asset_bias_map.items():
+            drivers = adata.get("drivers", {})
+            # Retail agreement untuk faktor D
+            retail_agreement_val: float | None = None
+            try:
+                _ASSET_TO_PAIR_LOOKUP = {
+                    "EUR": "EURUSD", "GBP": "GBPUSD", "JPY": "USDJPY",
+                    "AUD": "AUDUSD", "NZD": "NZDUSD", "CAD": "USDCAD",
+                    "CHF": "USDCHF", "USD": "EURUSD",
+                    "XAU": "XAUUSD", "BTC": "BTCUSD", "ETH": "ETHUSD",
+                }
+                pair_key = _ASSET_TO_PAIR_LOOKUP.get(asset)
+                if pair_key:
+                    pair_retail = retail_data.get("retail", {}).get(pair_key, {})
+                    retail_agreement_val = pair_retail.get("agreement")
+            except Exception:
+                pass
+
+            try:
+                conf = compute_confidence(
+                    driver_dict=drivers,
+                    retail_agreement=retail_agreement_val,
+                )
+            except Exception as exc:
+                logger.warning("compute_confidence[%s] gagal: %s", asset, exc)
+                conf = 0.0
+            adata["confidence"] = conf
+
+        # 3c. Compute pairs (baseline)
+        try:
+            pair_bias_map = compute_pairs(asset_bias_map)
+        except Exception as exc:
+            st.error(f"compute_pairs() gagal: {exc}")
+            pair_bias_map = {}
+
+        # 3d. News delta (cached — mahal)
+        try:
+            headlines = news_data.get("headlines", [])
+            headlines_json = json.dumps(headlines)
+            news_delta_map, news_clusters = cached_compute_news_delta(headlines_json)
+        except Exception as exc:
+            logger.error("compute_news_delta gagal: %s", exc)
+            news_delta_map = {}
+            news_clusters = []
+
+    # -----------------------------------------------------------------------
+    # STEP 4 — Header (dengan status sumber lengkap)
+    # -----------------------------------------------------------------------
+    sources_status = build_sources_status(
+        prices_data, macro_data, cot_data,
+        retail_data, news_data, calendar_data,
+    )
+
+    with header_placeholder.container():
+        render_header(sources_status)
+
+    # -----------------------------------------------------------------------
+    # STEP 5 — Badges sumber gagal (non-fatal)
+    # -----------------------------------------------------------------------
+    failed_sources = [s for s, st_val in sources_status.items() if st_val == "fail"]
+    if failed_sources:
+        st.warning(
+            f"⚠️ Sumber gagal: **{', '.join(failed_sources)}** — "
+            "data mungkin tidak lengkap. Engine tetap berjalan dengan data yang ada.",
+            icon="⚠️",
+        )
+
+    # -----------------------------------------------------------------------
+    # STEP 6 — Toggle Baseline vs News-Overlaid
+    # -----------------------------------------------------------------------
+    toggle_col, _ = st.columns([2, 5])
+    with toggle_col:
+        show_overlay = st.toggle(
+            "★ News Overlay aktif",
+            value=False,
+            help="Tampilkan bias_score = baseline + news_delta (cap ±30). "
+                 "Nonaktif = baseline murni dari R_hard / COT / Retail.",
+        )
+
+    # -----------------------------------------------------------------------
+    # STEP 7 — Tabs display
+    # -----------------------------------------------------------------------
+    tab_board, tab_pairs, tab_detail, tab_news, tab_events = st.tabs([
+        "📈 Bias Board",
+        "🔍 Pair Scanner",
+        "🔬 Detail Skor",
+        "📰 News Feed",
+        "⏰ Risk Events",
+    ])
+
+    with tab_board:
+        try:
+            render_bias_board(asset_bias_map, news_delta_map, show_overlay)
+        except Exception as exc:
+            st.error(f"Bias Board error: {exc}")
+
+    with tab_pairs:
+        try:
+            render_pair_scanner(pair_bias_map, asset_bias_map, show_overlay, news_delta_map)
+        except Exception as exc:
+            st.error(f"Pair Scanner error: {exc}")
+
+    with tab_detail:
+        try:
+            render_score_detail(asset_bias_map, news_delta_map)
+        except Exception as exc:
+            st.error(f"Detail Skor error: {exc}")
+
+    with tab_news:
+        try:
+            render_news_feed(news_clusters, news_delta_map, news_data)
+        except Exception as exc:
+            st.error(f"News Feed error: {exc}")
+
+    with tab_events:
+        try:
+            render_key_risk_events(calendar_data)
+        except Exception as exc:
+            st.error(f"Key Risk Events error: {exc}")
+
+    # -----------------------------------------------------------------------
+    # STEP 8 — Footer
+    # -----------------------------------------------------------------------
+    render_footer()
+
+
+# ===========================================================================
+# ENTRY
+# ===========================================================================
+if __name__ == "__main__":
+    main()
