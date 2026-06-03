@@ -1,3 +1,4 @@
+# QF_BIAS_BUILD: news-multisource (FinancialJuice+Fed+ForexLive) (2026-06-03)
 """
 collectors/news.py — FinancialJuice RSS headline fetcher.
 
@@ -61,8 +62,33 @@ URL feed RSS publik FinancialJuice.
 Alternatif bila format=rss tidak bekerja: https://www.financialjuice.com/feed.ashx?format=atom
 """
 
-_MAX_HEADLINES: int = 60
-"""Jumlah headline maksimal yang di-fetch per panggilan."""
+# ---------------------------------------------------------------------------
+# FEED REGISTRY — multi-source (semua RSS, di-merge + di-dedup oleh clustering)
+# ---------------------------------------------------------------------------
+# (nama_sumber, url). Tiap feed di-fetch terpisah dengan try/except sendiri:
+# satu feed mati TIDAK mematikan yang lain. raw_category dari tag feed (kalau ada);
+# kalau feed tak punya tag (mis. Fed), raw_category jatuh ke fallback default per feed.
+#
+# Risiko blokir IP datacenter (pelajaran retail layer):
+#   - federalreserve.gov  : situs .gov, praktis tidak diblok. Sinyal primer hawkish/dovish.
+#   - financialjuice      : sudah terbukti jalan di deploy.
+#   - forexlive           : rebrand → InvestingLive; requests ikut redirect otomatis.
+# Untuk menambah/menghapus sumber: edit list ini saja. Tidak ada perubahan lain.
+_FEEDS: list[tuple[str, str]] = [
+    ("FinancialJuice", _FINANCIALJUICE_RSS_URL),
+    ("Fed",            "https://www.federalreserve.gov/feeds/press_monetary.xml"),
+    ("ForexLive",      "https://www.forexlive.com/feed"),
+]
+# Fallback raw_category bila feed tidak menyertakan tag kategori (mis. Fed press release).
+_FEED_DEFAULT_CATEGORY: dict[str, str] = {
+    "Fed": "CENTRAL_BANK",
+}
+
+_MAX_HEADLINES: int = 80
+"""Jumlah headline maksimal TOTAL (gabungan semua feed) yang dikembalikan."""
+
+_MAX_PER_FEED: int = 40
+"""Batas headline per feed sebelum merge (cegah satu feed mendominasi)."""
 
 _TIMEOUT: int = 15  # detik
 _MAX_RETRY: int = 2
@@ -192,81 +218,99 @@ def _clean_title(raw_title: str) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
-def get_news(max_headlines: int = _MAX_HEADLINES) -> dict:
-    """Fetch headline berita terbaru dari FinancialJuice RSS.
-
-    Args:
-        max_headlines: Batas jumlah headline (default 60). Feed biasanya berisi
-                       20–100 item tergantung aktivitas pasar.
-
-    Returns dict sesuai schema §4 news:
-        {
-          "as_of_utc": "2026-06-01T07:00:00Z",
-          "headlines": [
-            {
-              "ts_utc": "2026-06-01T06:45:00Z",
-              "ts_wib": "2026-06-01 13:45",
-              "title": "...",
-              "source": "FinancialJuice",
-              "raw_category": "CENTRAL BANKS"   ← atau null kalau tidak ada
-            },
-            ...
-          ]
-        }
-
-    Headlines diurutkan descending by timestamp (terbaru duluan).
-    Kalau fetch gagal total → kembalikan dict dengan headlines=[] dan
-    tambahkan key "error" berisi pesan error (tidak crash).
-    """
-    ts_now = now_utc()
-
-    try:
-        feed = _fetch_feed_with_retry(_FINANCIALJUICE_RSS_URL)
-    except Exception as exc:
-        logger.error("get_news: fetch RSS gagal: %s", exc)
-        return {
-            "as_of_utc": fmt_iso_utc(ts_now),
-            "headlines": [],
-            "error": str(exc),
-        }
-
+def _parse_feed_entries(
+    feed: feedparser.FeedParserDict,
+    source_name: str,
+    ts_now: datetime,
+    max_n: int,
+) -> list[dict]:
+    """Ubah entries feedparser → list headline dict (schema §4). Tag source."""
     entries = feed.get("entries", [])
-    if not entries:
-        logger.warning("get_news: feed berhasil di-fetch tapi entries kosong.")
-
-    headlines: list[dict] = []
-    for entry in entries[:max_headlines]:
-        ts_utc = _parse_entry_timestamp(entry)
-        if ts_utc is None:
-            # Fallback ke sekarang dengan peringatan — lebih baik ada entry
-            # dengan timestamp kurang akurat daripada tidak ada sama sekali.
-            ts_utc = ts_now
-            logger.debug("Timestamp fallback untuk entry: %s", getattr(entry, "title", "?"))
-
+    default_cat = _FEED_DEFAULT_CATEGORY.get(source_name)
+    out: list[dict] = []
+    for entry in entries[:max_n]:
         raw_title = getattr(entry, "title", "")
         if not raw_title:
             continue  # skip entry tanpa judul
 
-        title = _clean_title(raw_title)
-        raw_category = _extract_raw_category(entry)
-        link = getattr(entry, "link", "") or ""   # URL artikel (RSS link)
+        ts_utc = _parse_entry_timestamp(entry)
+        if ts_utc is None:
+            # Lebih baik ada entry dengan timestamp kurang akurat daripada hilang.
+            ts_utc = ts_now
+            logger.debug("Timestamp fallback (%s): %s", source_name, raw_title)
 
-        headlines.append({
+        title = _clean_title(raw_title)
+        raw_category = _extract_raw_category(entry) or default_cat
+        link = getattr(entry, "link", "") or ""
+
+        out.append({
             "ts_utc": fmt_iso_utc(ts_utc),
             "ts_wib": fmt_wib_display(ts_utc),
             "title": title,
-            "source": _SOURCE_NAME,
+            "source": source_name,
             "raw_category": raw_category,  # None kalau tidak ada
             "link": link,
         })
+    return out
 
-    # Urutkan descending by ts_utc (terbaru duluan)
+
+def get_news(max_headlines: int = _MAX_HEADLINES) -> dict:
+    """Fetch headline dari SEMUA feed di _FEEDS, merge + tag source.
+
+    Tiap feed di-fetch terpisah dengan try/except sendiri: satu feed mati
+    TIDAK mematikan yang lain (defensif terhadap blokir IP datacenter).
+
+    Returns dict sesuai schema §4 news + meta sumber:
+        {
+          "as_of_utc": "...",
+          "headlines": [ {ts_utc, ts_wib, title, source, raw_category, link}, ... ],
+          "sources_ok":     ["FinancialJuice", "Fed"],   # feed yang hidup
+          "sources_failed": ["ForexLive"],               # feed yang gagal
+          "error": "..."   # HANYA kalau SEMUA feed gagal
+        }
+
+    Headlines diurutkan descending by timestamp (terbaru duluan).
+    Dedup lintas-sumber TIDAK dilakukan di sini (itu tugas clustering di engine).
+    """
+    ts_now = now_utc()
+
+    headlines: list[dict] = []
+    sources_ok: list[str] = []
+    sources_failed: list[str] = []
+    errors: list[str] = []
+
+    for source_name, url in _FEEDS:
+        try:
+            feed = _fetch_feed_with_retry(url)
+            parsed = _parse_feed_entries(feed, source_name, ts_now, _MAX_PER_FEED)
+            if parsed:
+                headlines.extend(parsed)
+                sources_ok.append(source_name)
+                logger.info("get_news: %s → %d headline", source_name, len(parsed))
+            else:
+                # Fetch sukses tapi 0 entry → anggap gagal (sumber tidak berguna kali ini)
+                sources_failed.append(source_name)
+                errors.append(f"{source_name}: 0 entry")
+                logger.warning("get_news: %s fetch OK tapi 0 entry", source_name)
+        except Exception as exc:
+            sources_failed.append(source_name)
+            errors.append(f"{source_name}: {exc}")
+            logger.warning("get_news: %s gagal: %s (lanjut feed lain)", source_name, exc)
+
+    # Urutkan terbaru dulu, lalu cap total
     headlines.sort(key=lambda h: h["ts_utc"], reverse=True)
+    headlines = headlines[:max_headlines]
 
-    return {
+    result = {
         "as_of_utc": fmt_iso_utc(ts_now),
         "headlines": headlines,
+        "sources_ok": sources_ok,
+        "sources_failed": sources_failed,
     }
+    # error HANYA kalau semua feed gagal (tidak ada headline sama sekali)
+    if not headlines:
+        result["error"] = "; ".join(errors) or "semua feed kosong"
+    return result
 
 
 # ---------------------------------------------------------------------------
