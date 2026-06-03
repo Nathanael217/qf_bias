@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: us-surprise-factor (FRED actual + sigma + polarity + time-decay) (2026-06-03c)
+# QF_BIAS_BUILD: us-surprise + JOLTS + FMP-actual-layer (2026-06-03d)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -65,6 +65,7 @@ try:
     from collectors.news import get_news as _get_news_raw
     from collectors.calendar_evt import get_calendar as _get_calendar_raw
     from collectors.indicators_us import enrich_us_actuals as _enrich_us_raw
+    from collectors.actuals_fmp import enrich_actuals_fmp as _enrich_fmp_raw
     from engine.scoring import compute_all_assets
     from engine.news_overlay import compute_news_delta
     from engine.confidence import compute_confidence
@@ -199,6 +200,20 @@ def cached_get_news() -> dict:
             "as_of_utc": fmt_iso_utc(now_utc()),
             "headlines": [], "_error": str(exc),
         }
+
+
+@st.cache_data(ttl=TTL["calendar"], show_spinner=False)
+def cached_enrich_fmp(events_json: str) -> dict:
+    """Isi actual (DISPLAY-only) dari FMP utk event yg belum punya actual. Cached.
+    Tanpa FMP_API_KEY / gagal → events apa adanya."""
+    import json
+    try:
+        events = json.loads(events_json) if events_json else []
+        return _enrich_fmp_raw(events)
+    except Exception as exc:
+        logger.error("enrich_actuals_fmp() exception: %s", exc)
+        import json as _j
+        return {"events": _j.loads(events_json) if events_json else [], "enriched": [], "_meta": {"error": str(exc)}}
 
 
 @st.cache_data(ttl=TTL["calendar"], show_spinner=False)
@@ -808,11 +823,24 @@ def render_key_risk_events(calendar_data: dict) -> None:
     events = calendar_data.get("events", [])
     _us_enr = calendar_data.get("_us_enriched", [])
     _us_meta = calendar_data.get("_us_meta", {})
+    _fmp_enr = calendar_data.get("_fmp_enriched", [])
+    _fmp_meta = calendar_data.get("_fmp_meta", {})
+    # Status enrichment SELALU tampil (jangan biarkan user menebak kenapa actual kosong)
+    _bits = []
     if _us_enr:
-        st.caption(f"🟢 Actual US dari FRED terisi untuk {len(_us_enr)} event: {', '.join(_us_enr[:6])}"
-                   + (" …" if len(_us_enr) > 6 else ""))
+        _bits.append(f"🟢 FRED (skor): {len(_us_enr)} → {', '.join(_us_enr[:5])}" + (" …" if len(_us_enr) > 5 else ""))
     elif _us_meta.get("error"):
-        st.caption(f"⚠ FRED actual gagal: {_us_meta['error']}")
+        _bits.append(f"⚠ FRED gagal: {_us_meta['error']}")
+    else:
+        _bits.append("⚪ FRED: 0 event US ber-mapping yang sudah rilis di window ini (CPI/NFP/PCE/JOLTS/Claims bulanan)")
+    if _fmp_enr:
+        _bits.append(f"🔵 FMP (display): {len(_fmp_enr)} → {', '.join(_fmp_enr[:5])}" + (" …" if len(_fmp_enr) > 5 else ""))
+    elif _fmp_meta.get("error"):
+        _bits.append(f"⚠ FMP gagal: {_fmp_meta['error']}")
+    elif _fmp_meta.get("note", "").startswith("FMP_API_KEY"):
+        _bits.append("⚪ FMP nonaktif (set FMP_API_KEY di Secrets untuk actual ISM dll)")
+    for _b in _bits:
+        st.caption(_b)
     if calendar_data.get("_error") and not events:
         st.warning(f"Calendar fetch gagal: {calendar_data['_error']}")
         return
@@ -1270,11 +1298,20 @@ def main() -> None:
         calendar_data["_us_enriched"] = _enrich.get("enriched", [])
         calendar_data["_us_meta"] = _enrich.get("_meta", {})
 
-        # Released events → surprises untuk macro
+        # Lapisan FMP (opsional, key-gated): isi actual sisanya (ISM dll) — DISPLAY ONLY.
+        _fmp = cached_enrich_fmp(json.dumps(calendar_data.get("events", [])))
+        calendar_data["events"] = _fmp.get("events", calendar_data.get("events", []))
+        calendar_data["_fmp_enriched"] = _fmp.get("enriched", [])
+        calendar_data["_fmp_meta"] = _fmp.get("_meta", {})
+
+        # Released events → surprises untuk macro.
+        # ATURAN DISIPLIN: HANYA event ber-σ (historical_std, dari FRED) yang menggerakkan
+        # skor. Actual dari FMP (tanpa σ) sengaja DIKECUALIKAN dari skor → display-only.
         released_events = [
             e for e in calendar_data.get("events", [])
             if e.get("status") == "released"
                and e.get("actual") is not None
+               and e.get("historical_std") is not None
         ]
         cal_json = json.dumps(released_events)
         macro_data = cached_get_macro(cal_json)
