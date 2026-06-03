@@ -296,6 +296,7 @@ def build_surprises(
             continue
 
         historical_std = ev.get("historical_std")
+        polarity = float(ev.get("surprise_polarity", 1.0))  # +1 normal, -1 terbalik (unemployment)
 
         # Compute z
         if forecast is not None:
@@ -311,6 +312,9 @@ def build_surprises(
                     "%s %s: no historical_std — z is raw delta (not normalised)",
                     currency, name,
                 )
+            # Polarity: untuk indikator terbalik (mis. Unemployment Rate), beat = bearish.
+            if z is not None:
+                z = round(z * polarity, 4)
         else:
             z = None
 
