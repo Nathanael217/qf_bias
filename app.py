@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: news-multisource + nf-filters + riskevents-weekly-fix (2026-06-03)
+# QF_BIAS_BUILD: riskevents-parsehardened + nf-filters + news-multisource (2026-06-03b)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -812,9 +812,29 @@ def render_key_risk_events(calendar_data: dict) -> None:
     sunday_end = monday + timedelta(days=7)
 
     def _ev_wib(ev: dict):
-        ts = ev.get("ts_utc", "")
+        """Parse ts_utc → WIB. Tahan-banting: tidak bergantung HANYA pada
+        parse_iso_utc (yang bisa beda versi di deploy). Kalau gagal total,
+        return None — tapi kegagalan ini DIHITUNG di diagnostik (bukan ditelan)."""
+        ts = ev.get("ts_utc")
+        if not ts:
+            return None
+        # 1) jalur normal
         try:
             return parse_iso_utc(ts).astimezone(now_w.tzinfo)
+        except Exception:
+            pass
+        # 2) fallback parser mandiri (Z / offset / naive / spasi)
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            s = str(ts).strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            if " " in s and "T" not in s:
+                s = s.replace(" ", "T", 1)
+            d = _dt.fromisoformat(s)
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=_tz.utc)
+            return d.astimezone(now_w.tzinfo)
         except Exception:
             return None
 
@@ -880,6 +900,7 @@ def render_key_risk_events(calendar_data: dict) -> None:
 
     # Diagnostik rinci: tunjukkan PERSIS berapa event lolos tiap tahap (akhiri tebakan)
     n_total = len(events)
+    n_parse_fail = sum(1 for e in events if _ev_wib(e) is None)
     n_in_window = sum(1 for e in events if _in_window(e, w_start, w_end))
     n_impact = sum(1 for e in events if _in_window(e, w_start, w_end)
                    and (not impact_filter or e.get("impact", "LOW") in impact_filter))
@@ -890,15 +911,19 @@ def render_key_risk_events(calendar_data: dict) -> None:
             if _in_window(e, w_start, w_end):
                 statuses[e.get("status", "?")] = statuses.get(e.get("status", "?"), 0) + 1
         ccy_in_window = sorted({e.get("currency", "?") for e in events if _in_window(e, w_start, w_end)})
+        sample_ts = [str(e.get("ts_utc")) for e in events[:3]]
         st.warning(
             f"⚠ Diagnostik filter:\n\n"
             f"- Total event ter-fetch: **{n_total}**\n"
+            f"- **Gagal parse timestamp: {n_parse_fail}** ← kalau ini = total, masalahnya FORMAT ts_utc (version skew calendar_evt/timeutils), BUKAN window\n"
             f"- Lolos window waktu ini: **{n_in_window}** (status: {statuses})\n"
             f"- Setelah filter impact: **{n_impact}**\n"
             f"- Setelah filter currency: **{len(subset)}**\n\n"
+            f"Contoh ts_utc mentah: {sample_ts}\n\n"
             f"Currency yang ADA di window: {ccy_in_window}\n\n"
-            f"**Saran:** kalau 'lolos window' = 0 → tidak ada event di rentang waktu ini "
-            f"(normal di pagi/malam). Kalau >0 tapi akhirnya 0 → filter currency/impact terlalu ketat."
+            f"**Baca:** parse-fail=total → ganti calendar_evt.py+timeutils.py (skew). "
+            f"parse-fail=0 tapi window=0 → memang tidak ada event di rentang ini. "
+            f"window>0 tapi akhir 0 → filter impact/currency ketat."
         )
     elif n_in_window > 0:
         st.caption(f"📊 {n_in_window} event di window · {n_impact} lolos impact · {len(subset)} setelah currency")
