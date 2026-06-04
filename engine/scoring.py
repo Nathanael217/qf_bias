@@ -154,13 +154,17 @@ def score_R_hard(macro: dict[str, Any], asset: str) -> tuple[float, str]:
 
     surprises: list[dict] = _safe_get(macro, "surprises", asset, default=[])
     if surprises:
-        # Ambil event paling baru BY ts_utc (ISO-UTC → urut leksikografis = kronologis).
-        # FIX: jangan andalkan posisi list (build_surprises mempertahankan urutan input,
-        # belum tentu kronologis). Pilih z-not-None dengan ts_utc terbesar.
-        # CATATAN PLACEHOLDER: v1 hanya pakai SATU surprise (paling baru). Bila satu minggu
-        # banyak rilis (CPI+NFP+retail), agregasi (decay/impact-weighted) = keputusan backtest.
+        # Ambil event paling baru BY ts_utc; bila beberapa rilis di timestamp SAMA
+        # (mis. hari NFP: NFP+Unemployment+AHE; atau HICP headline+core), pilih |z|
+        # TERBESAR (surprise paling material) — bukan posisi-list arbitrer. Ini tie-break,
+        # BUKAN agregasi: tetap satu surprise. Agregasi multi-surprise (jumlah/decay/impact-
+        # weighted) = keputusan pembobotan → ranah backtest, sengaja belum dibuat.
         scored_evts = [e for e in surprises if e.get("z") is not None]
-        latest = max(scored_evts, key=lambda e: e.get("ts_utc") or "", default=None) if scored_evts else None
+        latest = None
+        if scored_evts:
+            latest_ts = max((e.get("ts_utc") or "") for e in scored_evts)
+            same_ts = [e for e in scored_evts if (e.get("ts_utc") or "") == latest_ts]
+            latest = max(same_ts, key=lambda e: abs(float(e["z"])))
         if latest and latest.get("z") is not None:
             z_raw = float(latest["z"])
             z_clamped = _clamp(z_raw, -_RHARD_Z_CLAMP, _RHARD_Z_CLAMP)
