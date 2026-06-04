@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: A1 EdgeFinder 9-endpoint parsers + Data Feeds A1 section + rates=CPI bug guard + ref doc (2026-06-04k)
+# QF_BIAS_BUILD: defensive parsebot import (fix collectors import crash) + A1 EdgeFinder feeds (2026-06-04l)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -1489,7 +1489,19 @@ def build_sources_status(
 
 def render_data_feeds() -> None:
     """Panel click-to-run parse.bot — tarik data hanya saat tombol diklik (hemat kredit)."""
-    from collectors import parsebot_client as pb
+    try:
+        from collectors import parsebot_client as pb
+    except Exception:
+        try:
+            import parsebot_client as pb  # fallback: file ditaruh di root repo
+        except Exception:
+            st.subheader("🛰️ Data Feeds — parse.bot")
+            st.error(
+                "Modul `parsebot_client.py` belum ada di repo. Upload file ini ke GitHub "
+                "di path **`collectors/parsebot_client.py`** (bukan root), commit, lalu reboot app. "
+                "Tanpa file ini, tab Data Feeds tidak bisa jalan."
+            )
+            return
 
     st.subheader("🛰️ Data Feeds — parse.bot (click-to-run)")
     has_key = pb._api_key() is not None
