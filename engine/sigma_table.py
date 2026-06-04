@@ -128,7 +128,7 @@ SIGMA_RULES: list[dict[str, Any]] = [
      "note": "GDP q/q / sentimen (pp/indeks) — seed generik"},
 ]
 
-_ACTUAL_SOURCE = "ForexFactory"  # actual datang dari feed faireconomy (calendar_evt)
+# (actual_source di-set oleh provider actual, mis. Eurostat — bukan di sini)
 
 
 def _norm(s: str | None) -> str:
@@ -149,7 +149,7 @@ def _match_rule(name_norm: str, currency: str | None) -> dict[str, Any] | None:
 
 def enrich_surprise_fields(events: list[dict[str, Any]]) -> dict[str, int]:
     """
-    Set historical_std + surprise_polarity + actual_source pada event yang
+    Set historical_std + surprise_polarity (+ sigma_basis) pada event yang
     cocok dengan SIGMA_RULES. Idempotent (skip kalau historical_std sudah ada).
     MUTASI in-place. Hanya event ber-σ yang nantinya lolos gate & men-drive skor.
 
@@ -193,8 +193,9 @@ def enrich_surprise_fields(events: list[dict[str, Any]]) -> dict[str, int]:
 
         ev["historical_std"] = float(rule["sigma"])
         ev["surprise_polarity"] = float(rule["polarity"])
-        ev["actual_source"] = _ACTUAL_SOURCE
         ev["sigma_basis"] = rule.get("note", "seed placeholder")
+        # CATATAN: actual_source TIDAK di-set di sini. faireconomy tak memberi actual
+        # (terbukti di deploy). Provider actual (mis. Eurostat) yang men-set actual_source.
 
         if is_released and has_actual:
             diag["scored"] += 1
