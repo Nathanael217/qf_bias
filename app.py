@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: myfxbook retail granular error surfacing (no_credentials/login/outlook stage visible in UI) + 2 sentiment (2026-06-04h)
+# QF_BIAS_BUILD: myfxbook keep-alive session + optional fixed-IP proxy (IP-bound session fix attempt) + retail diag (2026-06-04i)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
