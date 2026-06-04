@@ -132,11 +132,15 @@ def _get_with_retry(
     headers: dict[str, str] | None = None,
     timeout: int = _TIMEOUT,
     max_retry: int = _MAX_RETRY,
+    http: "requests.Session | None" = None,
 ) -> requests.Response:
     """GET request dengan retry + exponential backoff sederhana.
 
+    http: kalau diberi requests.Session, dipakai untuk reuse koneksi (keep-alive)
+          → login & outlook myfxbook keluar via 1 koneksi/IP yang sama (session IP-bound).
     Raises requests.RequestException setelah semua retry habis.
     """
+    client = http or requests
     default_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -144,6 +148,7 @@ def _get_with_retry(
             "Chrome/124.0.0.0 Safari/537.36"
         ),
         "Accept": "application/json, text/html, */*",
+        "Connection": "keep-alive",
     }
     if headers:
         default_headers.update(headers)
@@ -151,7 +156,7 @@ def _get_with_retry(
     last_exc: Exception = RuntimeError("No attempts made")
     for attempt in range(max_retry):
         try:
-            resp = requests.get(
+            resp = client.get(
                 url,
                 params=params,
                 headers=default_headers,
@@ -175,7 +180,7 @@ _MYFXBOOK_LOGIN_URL: str = "https://www.myfxbook.com/api/login.json"
 _MYFXBOOK_OUTLOOK_URL: str = "https://www.myfxbook.com/api/get-community-outlook.json"
 
 
-def _myfxbook_login(email: str, password: str) -> str:
+def _myfxbook_login(email: str, password: str, http: "requests.Session | None" = None) -> str:
     """Login ke Myfxbook API dan return session token.
 
     Raises RuntimeError bila login gagal atau respons tidak valid.
@@ -185,6 +190,7 @@ def _myfxbook_login(email: str, password: str) -> str:
     resp = _get_with_retry(
         _MYFXBOOK_LOGIN_URL,
         params={"email": email, "password": password},
+        http=http,
     )
     data = resp.json()
     if data.get("error"):
@@ -195,7 +201,7 @@ def _myfxbook_login(email: str, password: str) -> str:
     return session
 
 
-def _fetch_myfxbook(session: str) -> dict[str, float]:
+def _fetch_myfxbook(session: str, http: "requests.Session | None" = None) -> dict[str, float]:
     """Fetch long% per pair dari Myfxbook Community Outlook.
 
     Args:
@@ -223,7 +229,7 @@ def _fetch_myfxbook(session: str) -> dict[str, float]:
         }
     Catatan: name biasanya UPPERCASE tanpa separator. XAU dipresentasikan sbg "XAUUSD" atau "Gold".
     """
-    resp = _get_with_retry(_MYFXBOOK_OUTLOOK_URL, params={"session": session})
+    resp = _get_with_retry(_MYFXBOOK_OUTLOOK_URL, params={"session": session}, http=http)
     data = resp.json()
 
     if data.get("error"):
@@ -728,11 +734,25 @@ def get_retail(
             myfxbook_status = ("no_credentials: MYFXBOOK_EMAIL/PASSWORD tak terbaca di Secrets "
                                "(cek nama persis & tanpa [section])")
             raise RuntimeError(myfxbook_status)
+        # Satu Session keep-alive utk login + outlook → coba paksa egress IP konsisten
+        # (myfxbook session IP-bound; Streamlit bisa rotasi IP antar-request).
+        http = requests.Session()
+        # Opsional: proxy IP-tetap (solusi "VPN" sisi-server). Kalau keep-alive tak cukup,
+        # set MYFXBOOK_PROXY di Secrets (mis. "http://user:pass@host:port") → login+outlook
+        # keluar via 1 IP stabil → session valid. Tanpa secret ini = tak ada efek.
+        try:
+            import streamlit as _st  # type: ignore
+            _proxy = _st.secrets.get("MYFXBOOK_PROXY") or _st.secrets.get("myfxbook_proxy")
+            if _proxy:
+                http.proxies = {"http": _proxy, "https": _proxy}
+                logger.info("Myfxbook: pakai proxy IP-tetap")
+        except Exception:
+            pass
         if not session:
             _stage = "login"
-            session = _myfxbook_login(email, password)
+            session = _myfxbook_login(email, password, http=http)
         _stage = "outlook"
-        myfxbook_data = _fetch_myfxbook(session)
+        myfxbook_data = _fetch_myfxbook(session, http=http)
         sources_ok.append("myfxbook")
         myfxbook_status = f"ok: {len(myfxbook_data)} pairs"
         logger.info("Myfxbook: %d pairs fetched", len(myfxbook_data))
