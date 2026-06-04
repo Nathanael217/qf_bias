@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: Modul A #1 LIVE — Eurostat actual (EUR/HICP) + sigma_table + alignment guard; R_hard surprise-path on (2026-06-04c)
+# QF_BIAS_BUILD: Modul B LIVE — Groq news direction classifier (measurement-only, sidebar toggle, default OFF) + Modul A Eurostat + sigma_table (2026-06-04d)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -65,7 +65,8 @@ try:
     from collectors.news import get_news as _get_news_raw
     from collectors.calendar_evt import get_calendar as _get_calendar_raw
     from engine.scoring import compute_all_assets
-    from engine.news_overlay import compute_news_delta
+    from engine.news_overlay import compute_news_delta, cluster_events
+    from engine.groq_client import classify_headline as _groq_classify_raw
     from engine.sigma_table import enrich_surprise_fields
     from collectors.actuals_eurostat import get_eu_actuals as _get_eu_actuals_raw, apply_eu_actuals
     from engine.confidence import compute_confidence
@@ -225,15 +226,72 @@ def cached_get_eu_actuals() -> dict:
 
 
 @st.cache_data(ttl=TTL["news_overlay"], show_spinner=False)
-def cached_compute_news_delta(headlines_json: str) -> tuple[dict, list]:
-    """Cache news_overlay (proses mahal). Terima json string utk hashability."""
+def cached_compute_news_delta(headlines_json: str, override_json: str = "") -> tuple[dict, list]:
+    """Cache news_overlay (proses mahal). Terima json string utk hashability.
+    override_json: peta {event_title: {scores, impact}} dari Groq (kosong = keyword)."""
     import json
     try:
         headlines = json.loads(headlines_json) if headlines_json else []
-        return compute_news_delta(headlines)
+        override = json.loads(override_json) if override_json else None
+        return compute_news_delta(headlines, direction_override=override)
     except Exception as exc:
         logger.error("compute_news_delta() exception: %s", exc)
         return {}, []
+
+
+def _groq_key() -> str:
+    """Ambil GROQ_API_KEY dari st.secrets (atau env). '' kalau tak ada."""
+    try:
+        k = st.secrets.get("GROQ_API_KEY", "")
+    except Exception:
+        k = ""
+    if not k:
+        import os
+        k = os.environ.get("GROQ_API_KEY", "")
+    return k or ""
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_groq_classify(title: str) -> dict | None:
+    """Klasifikasi arah 1 headline via Groq, di-cache 1 jam. None → fallback keyword.
+    Groq MENGUKUR arah; engine tetap menghitung poin (news_overlay)."""
+    key = _groq_key()
+    if not key:
+        return None
+    try:
+        return _groq_classify_raw(title, key)
+    except Exception as exc:
+        logger.warning("cached_groq_classify gagal: %s", exc)
+        return None
+
+
+def build_groq_override(headlines: list, max_calls: int = 12) -> tuple[dict, dict]:
+    """
+    Cluster headlines → klasifikasi Groq utk maks `max_calls` cluster paling besar
+    (batasi kuota free-tier). Return (override_map, diag).
+    override_map: {event_title: {scores, impact, reasoning}} — hanya yang Groq sukses.
+    Fallback aman: cluster yang gagal/tak diklasifikasi → tetap keyword di engine.
+    """
+    from engine.news_overlay import magnitude as _mag
+    diag = {"clusters": 0, "classified": 0, "groq_ok": 0, "fallback": 0}
+    try:
+        clusters = cluster_events(headlines)
+    except Exception as exc:
+        logger.error("cluster_events gagal (groq prefilter): %s", exc)
+        return {}, diag
+    diag["clusters"] = len(clusters)
+    # Prefilter: prioritaskan cluster magnitude tertinggi (event paling material)
+    ranked = sorted(clusters, key=lambda c: _mag(c), reverse=True)[:max_calls]
+    override: dict[str, dict] = {}
+    for c in ranked:
+        diag["classified"] += 1
+        res = cached_groq_classify(c["event_title"])
+        if res and isinstance(res.get("scores"), dict):
+            override[c["event_title"]] = res
+            diag["groq_ok"] += 1
+        else:
+            diag["fallback"] += 1
+    return override, diag
 
 
 # ===========================================================================
@@ -605,6 +663,7 @@ def render_news_feed(
     news_clusters: list[dict],
     news_delta_map: dict[str, float] | None = None,
     news_meta: dict | None = None,
+    groq_diag: dict | None = None,
 ) -> None:
     """Render news clusters (sudah dedup) dari engine/news_overlay.
 
@@ -635,6 +694,13 @@ def render_news_feed(
     if news_meta.get("error") and not news_clusters:
         st.warning(f"Semua feed news gagal: {news_meta['error']}")
 
+    if groq_diag:
+        st.caption(
+            f"🤖 Groq arah: {groq_diag.get('clusters',0)} cluster · "
+            f"{groq_diag.get('classified',0)} dikirim · **{groq_diag.get('groq_ok',0)} terklasifikasi Groq** · "
+            f"{groq_diag.get('fallback',0)} fallback keyword. Engine tetap hitung poin (cap ±30 placeholder)."
+        )
+
     if not news_clusters:
         st.info("Tidak ada news cluster saat ini — feed kosong atau semua event sudah decay.")
         return
@@ -663,7 +729,7 @@ def render_news_feed(
         a for c in news_clusters
         for a, v in c.get("direction", {}).items() if v != "0"
     })
-    f1, f2, f3 = st.columns([2.2, 1.4, 1.4])
+    f1, f2, f3, f4 = st.columns([2.0, 1.3, 1.3, 1.3])
     with f1:
         asset_filter = st.multiselect(
             "Filter aset", options=avail_assets, default=[],
@@ -678,6 +744,12 @@ def render_news_feed(
         sort_mode = st.selectbox(
             "Urutkan", options=["Terbaru", "Magnitude"], index=0, key="nf_sort",
         )
+    with f4:
+        impact_filter = st.multiselect(
+            "Impact (Groq)", options=["high", "med", "low"], default=[],
+            key="nf_impact", help="Filter by impact hasil Groq. Kosong = semua. "
+                                   "Cluster tanpa klasifikasi Groq dianggap lolos.",
+        )
 
     # --- Terapkan filter ---
     filtered = []
@@ -686,6 +758,9 @@ def render_news_feed(
         if hide_neutral and not reactions:
             continue
         if asset_filter and not any(a in reactions for a in asset_filter):
+            continue
+        # Impact filter: cluster tanpa klasifikasi Groq (impact "") dianggap lolos.
+        if impact_filter and c.get("impact", "") and c.get("impact") not in impact_filter:
             continue
         filtered.append(c)
 
@@ -741,10 +816,17 @@ def render_news_feed(
                     )
 
             with col_meta:
+                _impact = cluster.get("impact", "")
+                _src = cluster.get("source", "keyword")
+                _impact_html = ""
+                if _impact:
+                    _ic = {"high": "#dc2626", "med": "#d97706", "low": "#6b7280"}.get(_impact, "#6b7280")
+                    _impact_html = (f"<br><span style='color:{_ic};font-weight:700;'>impact: {_impact}</span>"
+                                    f" <span style='color:#6b7280;'>· {_src}</span>")
                 st.markdown(
                     f"<div style='font-size:0.78rem;color:#6b7280;'>"
                     f"📰 {n_hl} hl &nbsp;|&nbsp; ⏱ {age_str}<br>"
-                    f"mag: {mag:.2f}</div>",
+                    f"mag: {mag:.2f}{_impact_html}</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -766,17 +848,28 @@ def render_news_feed(
                     )
 
             with col_act:
-                # Placeholder tombol Groq AI — aktif di sesi integrasi Groq berikutnya.
-                # Saat ini menampilkan tombol disabled + caption, supaya slot UI sudah siap.
-                st.button(
+                # On-demand: klasifikasi arah headline ini via Groq (Groq MENGUKUR;
+                # engine yang hitung poin). Nonaktif bila tak ada API key.
+                _gkey = bool(_groq_key())
+                _bkey = f"groq_{abs(hash(event_title))%10**8}"
+                if st.button(
                     "🤖 Groq context",
-                    key=f"groq_{abs(hash(event_title))%10**8}",
-                    disabled=True,
-                    help="Analisis konteks AI (Groq) — diaktifkan di update berikutnya. "
-                         "Akan menilai: kekuatan currency saat ini, dampak news ke trader, "
-                         "potensi sentimen, lalu memberi weighting terukur (engine yang hitung).",
+                    key=_bkey,
+                    disabled=not _gkey,
+                    help=("Klasifikasi arah + impact headline ini via Groq. "
+                          "Groq mengukur arah; engine deterministik yang hitung poin."
+                          if _gkey else "GROQ_API_KEY belum ada di Secrets."),
                     use_container_width=True,
-                )
+                ):
+                    _res = cached_groq_classify(event_title)
+                    if _res:
+                        _dirs = {a: ("+" if s > 0 else "-") for a, s in _res["scores"].items() if s != 0}
+                        _dtxt = ", ".join(f"{a}{d}" for a, d in sorted(_dirs.items())) or "tak ada arah jelas"
+                        st.caption(f"🤖 {_res.get('impact','?')} · {_dtxt}")
+                        if _res.get("reasoning"):
+                            st.caption(f"_{_res['reasoning']}_")
+                    else:
+                        st.caption("Groq tak tersedia (limit/down) — pakai keyword.")
 
             st.markdown(
                 "<hr style='border:none;border-top:1px solid #1f2937;margin:4px 0;'>",
@@ -1154,9 +1247,9 @@ def render_score_detail(
             "⚠️ Semua bobot = **placeholder** sampai backtest. Ini alat confluence, bukan sinyal arah.",
         ]
         st.markdown("\n".join(_rumus_lines))
-        st.info("🤖 Penjelasan naratif via Groq AI akan ditambahkan di update berikutnya — "
-                "akan menerjemahkan breakdown ini ke bahasa biasa + konteks kekuatan currency saat itu. "
-                "(Groq mengukur/menjelaskan; angka tetap dari engine deterministik.)")
+        st.info("🤖 Groq aktif untuk **klasifikasi arah news** (toggle di sidebar): Groq mengukur "
+                "arah+impact tiap cluster, engine deterministik yang hitung news_delta (cap ±30). "
+                "Penjelasan naratif per-skor menyusul. Angka selalu dari engine, bukan Groq.")
 
 
 # ===========================================================================
@@ -1261,6 +1354,26 @@ def main() -> None:
     # -----------------------------------------------------------------------
     header_placeholder = st.empty()
 
+    # Groq toggle (sidebar) — DEFAULT OFF → refresh normal tak pernah panggil Groq
+    # (nol risiko kuota / crash). ON = klasifikasi arah news via Groq (engine tetap hitung).
+    with st.sidebar:
+        st.markdown("### 🤖 Groq AI")
+        _has_key = bool(_groq_key())
+        use_groq = st.toggle(
+            "Klasifikasi arah news (Groq)",
+            value=False,
+            disabled=not _has_key,
+            help="Groq MENGUKUR arah news (nuansa yang keyword lewatkan, mis. 'BoJ should "
+                 "slow bond buying'=hawkish JPY). Engine tetap menghitung poin. "
+                 "Maks ~12 cluster/refresh, di-cache 1 jam (hemat kuota free-tier).",
+        )
+        if not _has_key:
+            st.caption("⚠️ GROQ_API_KEY belum ada di Secrets — toggle nonaktif.")
+        elif use_groq:
+            st.caption("Aktif: arah dari Groq, fallback keyword bila limit/down.")
+        else:
+            st.caption("Nonaktif: arah dari keyword (default).")
+
     # -----------------------------------------------------------------------
     # STEP 2 — Fetch collectors (semua cached TTL)
     # -----------------------------------------------------------------------
@@ -1363,11 +1476,17 @@ def main() -> None:
         try:
             headlines = news_data.get("headlines", [])
             headlines_json = json.dumps(headlines)
-            news_delta_map, news_clusters = cached_compute_news_delta(headlines_json)
+            override_json = ""
+            _groq_diag = None
+            if use_groq:
+                _override, _groq_diag = build_groq_override(headlines)
+                override_json = json.dumps(_override) if _override else ""
+            news_delta_map, news_clusters = cached_compute_news_delta(headlines_json, override_json)
         except Exception as exc:
             logger.error("compute_news_delta gagal: %s", exc)
             news_delta_map = {}
             news_clusters = []
+            _groq_diag = None
 
     # -----------------------------------------------------------------------
     # STEP 4 — Header (dengan status sumber lengkap)
@@ -1434,7 +1553,7 @@ def main() -> None:
 
     with tab_news:
         try:
-            render_news_feed(news_clusters, news_delta_map, news_data)
+            render_news_feed(news_clusters, news_delta_map, news_data, _groq_diag)
         except Exception as exc:
             st.error(f"News Feed error: {exc}")
 
