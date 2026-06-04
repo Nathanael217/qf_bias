@@ -51,6 +51,8 @@ class NewsClusterDisplay(TypedDict):
     magnitude: float
     age_min: float
     link: str
+    impact: str                 # "" | "low" | "med" | "high" (dari Groq; display-only)
+    source: str                 # "keyword" | "groq" (asal klasifikasi arah)
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +466,7 @@ def compute_news_delta(
     similarity_threshold: float = 0.80,
     window_minutes: float = 30.0,
     now_utc: datetime | None = None,
+    direction_override: dict[str, dict] | None = None,
 ) -> tuple[dict[str, float], list[NewsClusterDisplay]]:
     """
     Pipeline lengkap: headlines → delta per asset + display clusters.
@@ -500,8 +503,18 @@ def compute_news_delta(
     display_clusters: list[NewsClusterDisplay] = []
 
     for cluster in clusters:
-        # Klasifikasi arah berdasarkan judul event representatif
-        scores = classify_direction(cluster["event_title"])
+        # Klasifikasi arah: kalau ada override Groq utk judul ini → pakai skor Groq
+        # (Groq MENGUKUR arah). Kalau tidak → fallback keyword classify_direction.
+        # Magnitude/decay/scale/cap di bawah TETAP dihitung engine (tak berubah).
+        ov = direction_override.get(cluster["event_title"]) if direction_override else None
+        if ov and isinstance(ov.get("scores"), dict):
+            scores = {a: float(ov["scores"].get(a, 0.0)) for a in _ALL_ASSETS}
+            cl_impact = ov.get("impact", "") or ""
+            cl_source = "groq"
+        else:
+            scores = classify_direction(cluster["event_title"])
+            cl_impact = ""
+            cl_source = "keyword"
         mag = magnitude(cluster)
         decay = time_decay(cluster["age_min"])
         weight = mag * decay  # kontribusi event ini
@@ -525,6 +538,8 @@ def compute_news_delta(
             magnitude=round(mag, 3),
             age_min=cluster["age_min"],
             link=cluster.get("link", ""),
+            impact=cl_impact,
+            source=cl_source,
         ))
 
     # --- 3. Scale ke ±100 range (delta dalam satuan raw score × weight,
