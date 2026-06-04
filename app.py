@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: lean surprise LIVE — actual via faireconomy + σ seed table (sigma_table.py), R_hard surprise-path on (2026-06-04b)
+# QF_BIAS_BUILD: Modul A #1 LIVE — Eurostat actual (EUR/HICP) + sigma_table + alignment guard; R_hard surprise-path on (2026-06-04c)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -67,6 +67,7 @@ try:
     from engine.scoring import compute_all_assets
     from engine.news_overlay import compute_news_delta
     from engine.sigma_table import enrich_surprise_fields
+    from collectors.actuals_eurostat import get_eu_actuals as _get_eu_actuals_raw, apply_eu_actuals
     from engine.confidence import compute_confidence
     from engine.pairs import compute_pairs, rank_pairs
     _IMPORTS_OK = True
@@ -211,6 +212,16 @@ def cached_get_calendar() -> dict:
             "as_of_utc": fmt_iso_utc(now_utc()),
             "events": [], "_error": str(exc),
         }
+
+
+@st.cache_data(ttl=TTL["macro"], show_spinner=False)
+def cached_get_eu_actuals() -> dict:
+    """Cache fetch actual EUR dari Eurostat (network; flash bulanan → TTL macro 6 jam)."""
+    try:
+        return _get_eu_actuals_raw()
+    except Exception as exc:
+        logger.error("get_eu_actuals() exception: %s", exc)
+        return {}
 
 
 @st.cache_data(ttl=TTL["news_overlay"], show_spinner=False)
@@ -793,16 +804,23 @@ def render_key_risk_events(calendar_data: dict) -> None:
 
     events = calendar_data.get("events", [])
     _d = calendar_data.get("_surprise_diag") or {}
-    if _d.get("released_actual", 0) > 0 or _d.get("released", 0) > 0:
+    _eu = calendar_data.get("_eu_diag") or {}
+    if _eu.get("matched", 0) > 0:
         st.caption(
-            f"📈 Surprise (actual via faireconomy): {_d.get('released',0)} released · "
-            f"{_d.get('released_actual',0)} ada actual · **{_d.get('scored',0)} di-score** (R_hard) · "
-            f"{_d.get('no_sigma',0)} tanpa σ (display-only) · {_d.get('skipped',0)} di-skip (rate/speech). "
-            f"σ = seed placeholder sampai backtest."
+            f"🇪🇺 Eurostat actual (EUR): {_eu.get('matched',0)} event cocok · "
+            f"**{_eu.get('filled',0)} terisi** · {_eu.get('misaligned',0)} ditolak alignment guard · "
+            f"{_eu.get('no_data',0)} tanpa data."
+        )
+    if _d.get("released", 0) > 0:
+        st.caption(
+            f"📈 Surprise → R_hard: {_d.get('released',0)} released · "
+            f"{_d.get('released_actual',0)} ada actual (Eurostat utk EUR; sumber resmi lain menyusul) · "
+            f"**{_d.get('scored',0)} di-score** · {_d.get('no_sigma',0)} tanpa σ (display-only) · "
+            f"{_d.get('skipped',0)} di-skip (rate/speech). σ + bobot = placeholder sampai backtest."
         )
     else:
-        st.caption("ℹ️ Belum ada event released minggu ini. Surprise → R_hard aktif begitu ada actual "
-                   "(faireconomy) pada indikator yang dikenal sigma_table.")
+        st.caption("ℹ️ Belum ada event released minggu ini. Surprise → R_hard aktif begitu ada "
+                   "actual (API resmi) pada indikator yang dikenal sigma_table.")
     if calendar_data.get("_error") and not events:
         st.warning(f"Calendar fetch gagal: {calendar_data['_error']}")
         return
@@ -1261,6 +1279,14 @@ def main() -> None:
         #   Keanggotaan tabel = gate scoring; indikator tak dikenal tetap display-only.
         #   σ = SEED PLACEHOLDER → ganti dgn σ terukur dari histori + backtest.
         import json
+
+        # MODUL A #1 — Actual real-time via API resmi Eurostat (EUR/HICP).
+        # faireconomy TERBUKTI tak mengirim actual → diambil dari penerbit (Eurostat).
+        # apply_eu_actuals men-set actual+actual_source dgn ALIGNMENT GUARD (previous
+        # seri ≈ previous kalender); kalau tak align → tolak (tak ada actual palsu).
+        _eu_actuals = cached_get_eu_actuals()
+        _eu_diag = apply_eu_actuals(calendar_data.get("events", []), _eu_actuals)
+        calendar_data["_eu_diag"] = _eu_diag
 
         _surprise_diag = enrich_surprise_fields(calendar_data.get("events", []))
         calendar_data["_surprise_diag"] = _surprise_diag
