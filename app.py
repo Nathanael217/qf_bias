@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: 2 sentiment (COT lagging + myfxbook live via faktor D) + retail myfxbook-only + dumb-money + manual actual + Groq (2026-06-04g)
+# QF_BIAS_BUILD: myfxbook retail granular error surfacing (no_credentials/login/outlook stage visible in UI) + 2 sentiment (2026-06-04h)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -1656,6 +1656,17 @@ def main() -> None:
             "data mungkin tidak lengkap. Engine tetap berjalan dengan data yang ada.",
             icon="⚠️",
         )
+        # Detail spesifik myfxbook (retail) supaya tahu stage mana yang gagal
+        _mfx = (retail_data or {}).get("_meta", {}).get("myfxbook_status")
+        if _mfx and not _mfx.startswith("ok"):
+            hint = ""
+            if _mfx.startswith("no_credentials"):
+                hint = " → Secret tak terbaca. Pastikan nama persis `MYFXBOOK_EMAIL` & `MYFXBOOK_PASSWORD`, top-level (tanpa [section]), lalu reboot app."
+            elif _mfx.startswith("login_failed"):
+                hint = " → Login ditolak. Kalau pesannya soal kredensial = email/password salah. Kalau timeout/connection = IP datacenter Streamlit kemungkinan diblokir myfxbook (sama seperti scrape dulu)."
+            elif _mfx.startswith("outlook_failed"):
+                hint = " → Login OK tapi ambil data gagal (mungkin kuota free 100/hari, atau session IP-bound)."
+            st.caption(f"🔎 myfxbook retail: `{_mfx}`{hint}")
 
     # -----------------------------------------------------------------------
     # STEP 6 — Toggle Baseline vs News-Overlaid
