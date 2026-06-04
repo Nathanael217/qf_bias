@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: Modul B LIVE — Groq news direction classifier (measurement-only, sidebar toggle, default OFF) + Modul A Eurostat + sigma_table (2026-06-04d)
+# QF_BIAS_BUILD: Modul A #2 LIVE — manual actual input + Groq-vision screenshot pre-fill (cross-check guard) + Modul B Groq + Eurostat + sigma_table (2026-06-04e)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -67,6 +67,8 @@ try:
     from engine.scoring import compute_all_assets
     from engine.news_overlay import compute_news_delta, cluster_events
     from engine.groq_client import classify_headline as _groq_classify_raw
+    from engine.groq_client import extract_calendar_image as _groq_vision_raw
+    from engine.manual_actuals import make_event_id, apply_manual_actuals, match_vision_rows
     from engine.sigma_table import enrich_surprise_fields
     from collectors.actuals_eurostat import get_eu_actuals as _get_eu_actuals_raw, apply_eu_actuals
     from engine.confidence import compute_confidence
@@ -881,6 +883,107 @@ def render_news_feed(
 # SECTION 4d — KEY RISK EVENTS
 # ===========================================================================
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_vision_extract(image_bytes: bytes, media_type: str) -> list | None:
+    """Groq Scout baca screenshot kalender (cache per-gambar). None → input manual."""
+    key = _groq_key()
+    if not key:
+        return None
+    try:
+        import base64
+        b64 = base64.b64encode(image_bytes).decode()
+        return _groq_vision_raw(b64, key, media_type=media_type)
+    except Exception as exc:
+        logger.warning("cached_vision_extract gagal: %s", exc)
+        return None
+
+
+def render_manual_actual_input(calendar_data: dict) -> None:
+    """Form input ACTUAL manual + opsi baca screenshot (Groq vision). Disimpan ke
+    st.session_state['manual_actuals'] → main() inject sebelum scoring (rerun)."""
+    events = calendar_data.get("events", [])
+    released = [e for e in events
+                if e.get("status") == "released"
+                and e.get("impact") in ("HIGH", "MED")]
+    if not released:
+        return
+
+    st.session_state.setdefault("manual_actuals", {})
+    st.session_state.setdefault("vision_sugg", {})
+
+    with st.expander("✍️ Input Actual Manual (+ baca screenshot ForexFactory)", expanded=False):
+        st.caption("Isi **actual** sambil lihat screenshot FF-mu. Forecast/previous sudah dari feed. "
+                   "Tersimpan → engine hitung surprise → R_hard (σ placeholder). Manual menimpa sumber lain.")
+
+        _gkey = bool(_groq_key())
+        up = st.file_uploader("Screenshot kalender (opsional — Groq baca → pra-isi)",
+                              type=["png", "jpg", "jpeg"], key="ma_upload",
+                              disabled=not _gkey,
+                              help="Groq Scout transkrip tabel → dicocokkan + cross-check forecast/previous. "
+                                   "Kamu tetap konfirmasi sebelum disimpan." if _gkey
+                                   else "GROQ_API_KEY belum ada di Secrets.")
+        if up is not None and st.button("🔍 Baca screenshot (Groq)", key="ma_readbtn"):
+            with st.spinner("Groq membaca screenshot…"):
+                rows = cached_vision_extract(up.getvalue(), up.type or "image/png")
+            if not rows:
+                st.warning("Vision gagal/kosong — isi manual saja di bawah.")
+            else:
+                sugg = match_vision_rows(events, rows)
+                st.session_state["vision_sugg"] = {s["event_id"]: s for s in sugg}
+                n_hi = sum(1 for s in sugg if s["confidence"] == "high")
+                st.success(f"Terbaca {len(rows)} baris → {len(sugg)} cocok ({n_hi} confidence tinggi). "
+                           "Cek nilai di bawah, lalu Simpan.")
+
+        sugg_map = st.session_state.get("vision_sugg", {})
+        saved = st.session_state.get("manual_actuals", {})
+
+        with st.form("manual_actual_form"):
+            for ev in released:
+                eid = make_event_id(ev)
+                fc, pv = ev.get("forecast"), ev.get("previous")
+                cur = ev.get("actual")
+                prefill = saved.get(eid)
+                if prefill is None and eid in sugg_map:
+                    prefill = sugg_map[eid]["actual"]
+                if prefill is None and cur is not None:
+                    prefill = cur
+                c1, c2, c3, c4 = st.columns([3.4, 1, 1, 1.6])
+                with c1:
+                    tag = ""
+                    if eid in sugg_map:
+                        sc = sugg_map[eid]
+                        col = "#16a34a" if sc["confidence"] == "high" else "#d97706"
+                        tag = f" <span style='color:{col};font-size:0.7rem;'>🤖 {sc['confidence']}</span>"
+                    st.markdown(f"<div style='font-size:0.82rem;'><b>{ev.get('currency')}</b> "
+                                f"{ev.get('name')}{tag}</div>", unsafe_allow_html=True)
+                with c2:
+                    st.caption(f"F: {fc if fc is not None else '–'}")
+                with c3:
+                    st.caption(f"P: {pv if pv is not None else '–'}")
+                with c4:
+                    st.number_input("actual", value=prefill, key=f"ma_{eid}",
+                                    label_visibility="collapsed", format="%.4f")
+            cc1, cc2 = st.columns([1, 1])
+            submit = cc1.form_submit_button("💾 Simpan & hitung ulang", use_container_width=True)
+            clear = cc2.form_submit_button("🗑 Hapus semua manual", use_container_width=True)
+
+        if submit:
+            new_map = {}
+            for ev in released:
+                eid = make_event_id(ev)
+                val = st.session_state.get(f"ma_{eid}")
+                if val is not None:
+                    new_map[eid] = float(val)
+            st.session_state["manual_actuals"] = new_map
+            st.session_state["vision_sugg"] = {}
+            st.success(f"{len(new_map)} actual disimpan — menghitung ulang…")
+            st.rerun()
+        if clear:
+            st.session_state["manual_actuals"] = {}
+            st.session_state["vision_sugg"] = {}
+            st.rerun()
+
+
 def render_key_risk_events(calendar_data: dict) -> None:
     """Risk events 3 mode: Hari Ini (07:00 WIB cycle), Minggu Ini (Sen-Min + filter hari),
     Historis (2 minggu ke belakang dgn aktual). + tombol refresh lokal."""
@@ -920,6 +1023,11 @@ def render_key_risk_events(calendar_data: dict) -> None:
     if not events:
         st.info("Tidak ada event dalam window.")
         return
+
+    _md = calendar_data.get("_manual_diag") or {}
+    if _md.get("applied", 0) > 0:
+        st.caption(f"✍️ Actual manual aktif: **{_md['applied']} event** (menimpa sumber lain) → masuk R_hard.")
+    render_manual_actual_input(calendar_data)
 
     now_w = now_wib()
 
@@ -1400,6 +1508,12 @@ def main() -> None:
         _eu_actuals = cached_get_eu_actuals()
         _eu_diag = apply_eu_actuals(calendar_data.get("events", []), _eu_actuals)
         calendar_data["_eu_diag"] = _eu_diag
+
+        # MODUL A #2 — Actual MANUAL (input user / hasil vision yang dikonfirmasi).
+        # Prioritas tertinggi → menimpa Eurostat. Manusia = verifikator.
+        _manual_map = st.session_state.get("manual_actuals", {})
+        _manual_diag = apply_manual_actuals(calendar_data.get("events", []), _manual_map)
+        calendar_data["_manual_diag"] = _manual_diag
 
         _surprise_diag = enrich_surprise_fields(calendar_data.get("events", []))
         calendar_data["_surprise_diag"] = _surprise_diag
