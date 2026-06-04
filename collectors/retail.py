@@ -742,24 +742,29 @@ def get_retail(
         logger.warning("Myfxbook gagal: %s", exc)
 
     # ---- FXSSI ----
+    # DINONAKTIFKAN: scrape FXSSI/Dukascopy gagal konsisten dari IP datacenter
+    # (handover). Myfxbook API = sumber retail tunggal yang andal. Set True untuk re-enable.
+    _USE_DEAD_SCRAPES = False
     fxssi_data: dict[str, float] | None = None
-    try:
-        fxssi_data = _fetch_fxssi()
-        sources_ok.append("fxssi")
-        logger.info("FXSSI: %d pairs fetched", len(fxssi_data))
-    except Exception as exc:
-        sources_failed.append("fxssi")
-        logger.warning("FXSSI gagal: %s", exc)
+    if _USE_DEAD_SCRAPES:
+        try:
+            fxssi_data = _fetch_fxssi()
+            sources_ok.append("fxssi")
+            logger.info("FXSSI: %d pairs fetched", len(fxssi_data))
+        except Exception as exc:
+            sources_failed.append("fxssi")
+            logger.warning("FXSSI gagal: %s", exc)
 
     # ---- Dukascopy ----
     dukascopy_data: dict[str, float] | None = None
-    try:
-        dukascopy_data = _fetch_dukascopy()
-        sources_ok.append("dukascopy")
-        logger.info("Dukascopy: %d pairs fetched", len(dukascopy_data))
-    except Exception as exc:
-        sources_failed.append("dukascopy")
-        logger.warning("Dukascopy gagal: %s", exc)
+    if _USE_DEAD_SCRAPES:
+        try:
+            dukascopy_data = _fetch_dukascopy()
+            sources_ok.append("dukascopy")
+            logger.info("Dukascopy: %d pairs fetched", len(dukascopy_data))
+        except Exception as exc:
+            sources_failed.append("dukascopy")
+            logger.warning("Dukascopy gagal: %s", exc)
 
     retail = _aggregate_retail(myfxbook_data, fxssi_data, dukascopy_data)
 
