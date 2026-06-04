@@ -710,36 +710,38 @@ def get_retail(
 
     # ---- Myfxbook ----
     myfxbook_data: dict[str, float] | None = None
+    myfxbook_status = "not_attempted"
+    _stage = "init"
     try:
         session = myfxbook_session
+        email = myfxbook_email
+        password = myfxbook_password
+        if not session and not (email and password):
+            try:
+                import streamlit as st  # type: ignore
+                email = email or st.secrets.get("MYFXBOOK_EMAIL") or st.secrets.get("myfxbook_email")
+                password = password or st.secrets.get("MYFXBOOK_PASSWORD") or st.secrets.get("myfxbook_password")
+                session = session or st.secrets.get("MYFXBOOK_SESSION") or st.secrets.get("myfxbook_session")
+            except Exception:
+                pass
+        if not session and not (email and password):
+            myfxbook_status = ("no_credentials: MYFXBOOK_EMAIL/PASSWORD tak terbaca di Secrets "
+                               "(cek nama persis & tanpa [section])")
+            raise RuntimeError(myfxbook_status)
         if not session:
-            # Coba ambil credentials dari parameter atau st.secrets
-            email = myfxbook_email
-            password = myfxbook_password
-            if not (email and password):
-                # Fallback ke Streamlit secrets
-                try:
-                    import streamlit as st  # type: ignore
-                    email = st.secrets.get("MYFXBOOK_EMAIL") or st.secrets.get("myfxbook_email")
-                    password = st.secrets.get("MYFXBOOK_PASSWORD") or st.secrets.get("myfxbook_password")
-                    session = st.secrets.get("MYFXBOOK_SESSION") or st.secrets.get("myfxbook_session")
-                except ImportError:
-                    pass  # bukan environment Streamlit
-            if session:
-                pass  # sudah punya session dari secrets
-            elif email and password:
-                session = _myfxbook_login(email, password)
-            else:
-                raise RuntimeError(
-                    "Myfxbook: tidak ada session token atau email/password. "
-                    "Set MYFXBOOK_SESSION atau MYFXBOOK_EMAIL+MYFXBOOK_PASSWORD di secrets."
-                )
+            _stage = "login"
+            session = _myfxbook_login(email, password)
+        _stage = "outlook"
         myfxbook_data = _fetch_myfxbook(session)
         sources_ok.append("myfxbook")
+        myfxbook_status = f"ok: {len(myfxbook_data)} pairs"
         logger.info("Myfxbook: %d pairs fetched", len(myfxbook_data))
     except Exception as exc:
-        sources_failed.append("myfxbook")
-        logger.warning("Myfxbook gagal: %s", exc)
+        if "myfxbook" not in sources_failed:
+            sources_failed.append("myfxbook")
+        if not myfxbook_status.startswith("no_credentials"):
+            myfxbook_status = f"{_stage}_failed: {type(exc).__name__}: {str(exc)[:160]}"
+        logger.warning("Myfxbook gagal [%s]: %s", _stage, exc)
 
     # ---- FXSSI ----
     # DINONAKTIFKAN: scrape FXSSI/Dukascopy gagal konsisten dari IP datacenter
@@ -773,4 +775,5 @@ def get_retail(
         "sources_ok": sources_ok,
         "sources_failed": sources_failed,
         "retail": retail,
+        "_meta": {"myfxbook_status": myfxbook_status},
     }
