@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: defensive parsebot import (fix collectors import crash) + A1 EdgeFinder feeds (2026-06-04l)
+# QF_BIAS_BUILD: FF calendar per-day full-week format + Retail/COT separate tabs (card UI, fade vs follow) + COT-vs-CFTC dedup (2026-06-04n)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -1487,6 +1487,210 @@ def build_sources_status(
     return status
 
 
+def _get_pb():
+    """Import parsebot_client defensif (collectors/ atau root). None kalau belum ada."""
+    try:
+        from collectors import parsebot_client as pb
+        return pb
+    except Exception:
+        try:
+            import parsebot_client as pb  # fallback root
+            return pb
+        except Exception:
+            return None
+
+
+_FOREX_CCY = {"EUR", "USD", "JPY", "GBP", "CHF", "AUD", "CAD", "NZD"}
+_A1_INSTRUMENT_MAP = {  # nama A1 → (display, tag) untuk komoditas/crypto
+    "GOLD": ("XAUUSD", "KOMODITAS"), "SILVER": ("XAGUSD", "KOMODITAS"),
+    "BITCOIN": ("BTCUSD", "CRYPTO"), "Ethereum": ("ETHUSD", "CRYPTO"),
+}
+
+
+def _sentiment_card(rank: int, instrument: str, subtitle: str, tag: str,
+                    long_pct: float, short_pct: float, mode: str = "fade",
+                    extra: str = "") -> str:
+    """Kartu sentiment. mode='fade' (retail→kontrarian) / 'follow' (COT smart→searah)."""
+    lp = float(long_pct or 0.0)
+    sp = float(short_pct if short_pct is not None else (100 - lp))
+    crowd_long = lp >= 50
+    # Bacaan: retail = lawan kerumunan; COT smart = ikut
+    bull = (not crowd_long) if mode == "fade" else crowd_long
+    if abs(lp - 50) < 10:
+        reading, rc = "Netral", "#9ca3af"
+    elif bull:
+        reading, rc = "Cenderung bullish", "#22c55e"
+    else:
+        reading, rc = "Cenderung bearish", "#f97316"
+    skew = int(round(abs(lp - 50) * 2))
+    conv = "Tinggi" if skew >= 50 else ("Sedang" if skew >= 25 else "Rendah")
+    lean = "long" if crowd_long else "short"
+    label = "BACAAN KONTRARIAN" if mode == "fade" else "BACAAN SMART-MONEY"
+    return (
+        f"<div style='border:1px solid #2a2e39;border-radius:10px;padding:10px 14px;"
+        f"margin-bottom:8px;background:#0e1117;'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:flex-start;'>"
+        f"<div><span style='color:#6b7280;'>{rank}</span> "
+        f"<b style='font-size:15px;'>{instrument}</b> "
+        f"<span style='font-size:10px;color:#9ca3af;border:1px solid #2a2e39;border-radius:4px;"
+        f"padding:1px 6px;margin-left:4px;'>{tag}</span>"
+        f"<div style='font-size:11px;color:#6b7280;margin-top:2px;'>{subtitle}</div></div>"
+        f"<div style='text-align:right;'><div style='font-size:9px;color:#6b7280;letter-spacing:1px;'>{label}</div>"
+        f"<div style='color:{rc};font-weight:600;'>{reading}</div></div></div>"
+        f"<div style='display:flex;justify-content:space-between;font-size:12px;color:#9ca3af;margin-top:8px;'>"
+        f"<span>Long {lp:.0f}%</span><span>Short {sp:.0f}%</span></div>"
+        f"<div style='height:7px;border-radius:4px;overflow:hidden;display:flex;margin-top:3px;'>"
+        f"<div style='width:{lp}%;background:#22c55e;'></div>"
+        f"<div style='width:{sp}%;background:#f97316;'></div></div>"
+        f"<div style='font-size:11px;color:#6b7280;margin-top:6px;'>Kerumunan {lean} · "
+        f"Kemiringan {skew} · Conviction: <b>{conv}</b>{extra}</div></div>"
+    )
+
+
+def _render_ff_calendar(ff: list[dict], ts: str) -> None:
+    """Kalender FF rapi, dikelompokkan per hari, semua event (Senin–Minggu)."""
+    released = [e for e in ff if str(e.get("actual", "")).strip()]
+    st.caption(f"Ditarik: {ts} · {len(ff)} event minggu ini · {len(released)} sudah rilis (ada actual)")
+    only_major = st.checkbox("Hanya high/medium impact", value=True, key="ff_major_only")
+    imp_color = {"high": "#ef4444", "medium": "#f59e0b", "low": "#6b7280", "holiday": "#3b82f6"}
+    # urut per hari sesuai urutan kemunculan (FF sudah kronologis)
+    days: dict[str, list] = {}
+    for e in ff:
+        days.setdefault(e.get("date", "?"), []).append(e)
+    for day, evs in days.items():
+        shown = [e for e in evs if (not only_major or e.get("impact") in ("high", "medium"))]
+        if not shown:
+            continue
+        st.markdown(f"**{day}**")
+        rows = []
+        for e in shown:
+            ic = imp_color.get(e.get("impact", ""), "#6b7280")
+            act = str(e.get("actual", "")).strip()
+            fc = str(e.get("forecast", "")).strip()
+            # beat/miss kalau ada actual & forecast numerik
+            tag = ""
+            try:
+                if act and fc:
+                    a = float(act.replace("%", "").replace("K", "").replace("M", "").replace("B", ""))
+                    f = float(fc.replace("%", "").replace("K", "").replace("M", "").replace("B", ""))
+                    tag = " 🟢" if a > f else (" 🔴" if a < f else " ⚪")
+            except Exception:
+                tag = ""
+            rows.append({
+                "Waktu": e.get("time", ""),
+                "CCY": e.get("currency", ""),
+                "Impact": e.get("impact", ""),
+                "Event": e.get("name", ""),
+                "Actual": (act + tag) if act else "—",
+                "Forecast": fc or "—",
+                "Previous": str(e.get("previous", "")).strip() or "—",
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def render_retail_tab() -> None:
+    """Tab Retail sentiment (A1) — kartu per instrumen forex/emas/crypto, kontrarian."""
+    pb = _get_pb()
+    st.subheader("📊 Retail Sentiment — A1 EdgeFinder")
+    if pb is None:
+        st.error("Modul `parsebot_client.py` belum ada di repo (collectors/).")
+        return
+    has_key = pb._api_key() is not None
+    st.caption("Retail ritel = sumber **kontrarian**: kerumunan ekstrem di satu sisi → fade. "
+               "Display saja, bukan skor bias. Klik untuk tarik (cache 1 jam, klik ulang = 0 kredit).")
+    if st.button("🔄 Tarik / refresh retail", key="retail_tab_fetch", disabled=not has_key):
+        try:
+            with st.spinner("…"):
+                st.session_state["a1_retail_data"] = pb.parse_a1_retail(
+                    pb.fetch(pb.SCRAPERS["a1edge"], "get_retail_sentiment", {}, ttl=3_600))
+                st.session_state["a1_retail_ts"] = _now_wib_str()
+        except Exception as exc:
+            st.error(f"retail: {exc}")
+    if not has_key:
+        st.warning("Set `PARSE_API_KEY` di Secrets dulu.")
+    data = st.session_state.get("a1_retail_data")
+    if not data:
+        st.info("Belum ada data. Klik tombol di atas (atau tarik di tab Data Feeds).")
+        return
+    per_pair = data.get("per_pair", {})
+    st.caption(f"Update: {st.session_state.get('a1_retail_ts','-')}")
+    # bangun list instrumen: forex pair + emas + crypto
+    items = []
+    for name, v in per_pair.items():
+        lp = v.get("long_pct")
+        if lp is None:
+            continue
+        if len(name) == 6 and name[:3] in _FOREX_CCY and name[3:] in _FOREX_CCY:
+            items.append((name, name[:3] + "/" + name[3:], "FOREX", lp, v.get("short_pct")))
+        elif name in _A1_INSTRUMENT_MAP:
+            disp, tag = _A1_INSTRUMENT_MAP[name]
+            items.append((disp, name, tag, lp, v.get("short_pct")))
+    # urut by conviction (|long-50|) desc
+    items.sort(key=lambda x: abs((x[3] or 50) - 50), reverse=True)
+    for i, (disp, sub, tag, lp, sp) in enumerate(items, 1):
+        st.markdown(_sentiment_card(i, disp, sub, tag, lp, sp, mode="fade"),
+                    unsafe_allow_html=True)
+
+
+def render_cot_tab(cot_data: dict | None = None) -> None:
+    """Tab COT (A1, non-commercial = smart money) — kartu per aset, searah (follow)."""
+    pb = _get_pb()
+    st.subheader("🏛️ COT — A1 (non-commercial / smart money)")
+    if pb is None:
+        st.error("Modul `parsebot_client.py` belum ada di repo (collectors/).")
+        return
+    has_key = pb._api_key() is not None
+    st.caption("COT non-commercial = **smart money** → dibaca **searah** (ikut), bukan fade. "
+               "Data MINGGUAN. Display; faktor C di engine pilih satu sumber (lihat catatan dedup).")
+    if st.button("🔄 Tarik / refresh COT", key="cot_tab_fetch", disabled=not has_key):
+        try:
+            with st.spinner("…"):
+                st.session_state["a1_cot_data"] = pb.parse_a1_cot(
+                    pb.fetch(pb.SCRAPERS["a1edge"], "get_cot_report", {}, ttl=21_600))
+                st.session_state["a1_cot_ts"] = _now_wib_str()
+        except Exception as exc:
+            st.error(f"cot: {exc}")
+    if not has_key:
+        st.warning("Set `PARSE_API_KEY` di Secrets dulu.")
+    data = st.session_state.get("a1_cot_data")
+    if not data:
+        st.info("Belum ada data. Klik tombol di atas (atau tarik di tab Data Feeds).")
+        return
+    st.caption(f"Update: {st.session_state.get('a1_cot_ts','-')}")
+    # --- dedup vs CFTC lama (mingguan): kalau arah sama, engine pakai yang lama ---
+    cftc = (cot_data or {}).get("cot", {}) if cot_data else {}
+    if cftc:
+        agree = total = 0
+        for ccy in _FOREX_CCY:
+            a1 = data.get(ccy)
+            old = cftc.get(ccy)
+            if a1 and old and old.get("net") is not None and a1.get("net_pct") is not None:
+                total += 1
+                if (a1["net_pct"] >= 0) == (old["net"] >= 0):
+                    agree += 1
+        if total:
+            pct = round(100 * agree / total)
+            verdict = ("SAMA arah → engine pakai CFTC lama (gratis, jangan double-count)"
+                       if pct >= 80 else "BEDA arah → cek sumber mana yang benar")
+            st.caption(f"🔁 Dedup vs CFTC: {agree}/{total} mata uang searah ({pct}%). {verdict}")
+    # kartu per aset (mata uang + emas + crypto)
+    name_map = {"Gold": ("XAUUSD", "KOMODITAS"), "BTC": ("BTCUSD", "CRYPTO")}
+    items = []
+    for asset, v in data.items():
+        lp = v.get("long_pct")
+        if lp is None:
+            continue
+        if asset in _FOREX_CCY:
+            items.append((asset, asset, "FOREX (futures)", lp, v.get("short_pct")))
+        elif asset in name_map:
+            disp, tag = name_map[asset]
+            items.append((disp, asset, tag, lp, v.get("short_pct")))
+    items.sort(key=lambda x: abs((x[3] or 50) - 50), reverse=True)
+    for i, (disp, sub, tag, lp, sp) in enumerate(items, 1):
+        st.markdown(_sentiment_card(i, disp, sub, tag, lp, sp, mode="follow"),
+                    unsafe_allow_html=True)
+
+
 def render_data_feeds() -> None:
     """Panel click-to-run parse.bot — tarik data hanya saat tombol diklik (hemat kredit)."""
     try:
@@ -1516,6 +1720,15 @@ def render_data_feeds() -> None:
         st.metric("Call sesi ini", calls)
     if not has_key:
         st.warning("Set `PARSE_API_KEY` di Streamlit Secrets dulu untuk pakai panel ini.")
+    else:
+        _k = pb._api_key() or ""
+        _looks_placeholder = ("$" in _k) or (_k.strip() != _k) or (len(_k) < 12)
+        _msg = f"🔑 key terbaca: {len(_k)} karakter · …{_k[-4:] if len(_k) >= 4 else _k}"
+        if _looks_placeholder:
+            st.error(_msg + " — ⚠ mencurigakan (placeholder `$...`, ada spasi, atau terlalu pendek). "
+                     "Ini sebab 401-nya. Paste key ASLI dari parse.bot/settings tanpa kutip/spasi.")
+        else:
+            st.caption(_msg)
     st.caption(
         "💳 Budget free tier ~200 kredit/bln (verifikasi di dashboard-mu; buat scraper ~75, "
         "edit ~50; call situs anti-bot BISA >1 kredit). Rencana hemat di bawah."
@@ -1534,15 +1747,7 @@ def render_data_feeds() -> None:
             st.error(f"FF gagal: {exc}")
     ff = st.session_state.get("pb_ff_data")
     if ff:
-        st.caption(f"Ditarik: {st.session_state.get('pb_ff_ts','-')} · {len(ff)} event")
-        released = [e for e in ff if str(e.get("actual", "")).strip()]
-        st.caption(f"Sudah rilis (ada actual): {len(released)} event")
-        st.dataframe(
-            [{"Mata Uang": e["currency"], "Event": e["name"], "Impact": e["impact"],
-              "Actual": e["actual"], "Forecast": e["forecast"], "Previous": e["previous"],
-              "Waktu": f'{e["date"]} {e["time"]}'} for e in ff[:80]],
-            use_container_width=True, hide_index=True,
-        )
+        _render_ff_calendar(ff, st.session_state.get("pb_ff_ts", "-"))
 
     st.divider()
     # --- 2) myfxbook: suku bunga bank sentral (untuk benerin rate_diff mayor) ---
@@ -1843,12 +2048,14 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # STEP 7 — Tabs display
     # -----------------------------------------------------------------------
-    tab_board, tab_pairs, tab_detail, tab_news, tab_events, tab_feeds = st.tabs([
+    tab_board, tab_pairs, tab_detail, tab_news, tab_events, tab_retail, tab_cot, tab_feeds = st.tabs([
         "📈 Bias Board",
         "🔍 Pair Scanner",
         "🔬 Detail Skor",
         "📰 News Feed",
         "⏰ Risk Events",
+        "📊 Retail",
+        "🏛️ COT",
         "🛰️ Data Feeds",
     ])
 
@@ -1881,6 +2088,18 @@ def main() -> None:
             render_key_risk_events(calendar_data)
         except Exception as exc:
             st.error(f"Key Risk Events error: {exc}")
+
+    with tab_retail:
+        try:
+            render_retail_tab()
+        except Exception as exc:
+            st.error(f"Retail tab error: {exc}")
+
+    with tab_cot:
+        try:
+            render_cot_tab(cot_data)
+        except Exception as exc:
+            st.error(f"COT tab error: {exc}")
 
     with tab_feeds:
         try:
