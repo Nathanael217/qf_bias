@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: us-surprise + DBnomics-EUR + alignment-guard (2026-06-03g)
+# QF_BIAS_BUILD: lean surprise LIVE — actual via faireconomy + σ seed table (sigma_table.py), R_hard surprise-path on (2026-06-04b)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -64,11 +64,9 @@ try:
     from collectors.retail import get_retail as _get_retail_raw
     from collectors.news import get_news as _get_news_raw
     from collectors.calendar_evt import get_calendar as _get_calendar_raw
-    from collectors.indicators_us import enrich_us_actuals as _enrich_us_raw
-    from collectors.indicators_world import enrich_world_actuals as _enrich_world_raw
-    from collectors.actuals_fmp import enrich_actuals_fmp as _enrich_fmp_raw
     from engine.scoring import compute_all_assets
     from engine.news_overlay import compute_news_delta
+    from engine.sigma_table import enrich_surprise_fields
     from engine.confidence import compute_confidence
     from engine.pairs import compute_pairs, rank_pairs
     _IMPORTS_OK = True
@@ -201,47 +199,6 @@ def cached_get_news() -> dict:
             "as_of_utc": fmt_iso_utc(now_utc()),
             "headlines": [], "_error": str(exc),
         }
-
-
-@st.cache_data(ttl=TTL["calendar"], show_spinner=False)
-def cached_enrich_world(events_json: str) -> dict:
-    """Isi actual non-US dari DBnomics (gratis, tanpa key). Cached. Graceful."""
-    import json
-    try:
-        events = json.loads(events_json) if events_json else []
-        return _enrich_world_raw(events)
-    except Exception as exc:
-        logger.error("enrich_world_actuals() exception: %s", exc)
-        import json as _j
-        return {"events": _j.loads(events_json) if events_json else [], "enriched": [], "_meta": {"error": str(exc)}}
-
-
-@st.cache_data(ttl=TTL["calendar"], show_spinner=False)
-def cached_enrich_fmp(events_json: str) -> dict:
-    """Isi actual (DISPLAY-only) dari FMP utk event yg belum punya actual. Cached.
-    Tanpa FMP_API_KEY / gagal → events apa adanya."""
-    import json
-    try:
-        events = json.loads(events_json) if events_json else []
-        return _enrich_fmp_raw(events)
-    except Exception as exc:
-        logger.error("enrich_actuals_fmp() exception: %s", exc)
-        import json as _j
-        return {"events": _j.loads(events_json) if events_json else [], "enriched": [], "_meta": {"error": str(exc)}}
-
-
-@st.cache_data(ttl=TTL["calendar"], show_spinner=False)
-def cached_enrich_us(events_json: str) -> dict:
-    """Isi actual event US dari FRED (cached). Terima json string utk hashability.
-    Graceful: gagal → kembalikan events apa adanya (tanpa actual)."""
-    import json
-    try:
-        events = json.loads(events_json) if events_json else []
-        return _enrich_us_raw(events)
-    except Exception as exc:
-        logger.error("enrich_us_actuals() exception: %s", exc)
-        import json as _j
-        return {"events": _j.loads(events_json) if events_json else [], "enriched": [], "_meta": {"error": str(exc)}}
 
 
 @st.cache_data(ttl=TTL["calendar"], show_spinner=False)
@@ -835,36 +792,17 @@ def render_key_risk_events(calendar_data: dict) -> None:
             st.rerun()
 
     events = calendar_data.get("events", [])
-    _us_enr = calendar_data.get("_us_enriched", [])
-    _us_meta = calendar_data.get("_us_meta", {})
-    _fmp_enr = calendar_data.get("_fmp_enriched", [])
-    _fmp_meta = calendar_data.get("_fmp_meta", {})
-    _world_enr = calendar_data.get("_world_enriched", [])
-    _world_meta = calendar_data.get("_world_meta", {})
-    # Status enrichment SELALU tampil (jangan biarkan user menebak kenapa actual kosong)
-    _bits = []
-    if _us_enr:
-        _bits.append(f"🟢 FRED US (skor): {len(_us_enr)} → {', '.join(_us_enr[:5])}" + (" …" if len(_us_enr) > 5 else ""))
-    elif _us_meta.get("error"):
-        _bits.append(f"⚠ FRED gagal: {_us_meta['error']}")
+    _d = calendar_data.get("_surprise_diag") or {}
+    if _d.get("released_actual", 0) > 0 or _d.get("released", 0) > 0:
+        st.caption(
+            f"📈 Surprise (actual via faireconomy): {_d.get('released',0)} released · "
+            f"{_d.get('released_actual',0)} ada actual · **{_d.get('scored',0)} di-score** (R_hard) · "
+            f"{_d.get('no_sigma',0)} tanpa σ (display-only) · {_d.get('skipped',0)} di-skip (rate/speech). "
+            f"σ = seed placeholder sampai backtest."
+        )
     else:
-        _bits.append("⚪ FRED US: 0 event ber-mapping yang rilis di window ini")
-    if _us_meta.get("mismatched"):
-        _bits.append(f"🟡 FRED US misaligned (ditolak, previous≠kalender): {', '.join(_us_meta['mismatched'][:4])}")
-    if _world_enr:
-        _bits.append(f"🟢 DBnomics non-US (skor): {len(_world_enr)} → {', '.join(_world_enr[:5])}" + (" …" if len(_world_enr) > 5 else ""))
-    if _world_meta.get("mismatched"):
-        _bits.append(f"🟡 DBnomics misaligned (ditolak, previous≠kalender): {', '.join(_world_meta['mismatched'][:4])}")
-    if _world_meta.get("failed_series"):
-        _bits.append(f"⚠ DBnomics seri gagal resolve: {', '.join(_world_meta['failed_series'])} (cek kode di browser)")
-    if _fmp_enr:
-        _bits.append(f"🔵 FMP (display): {len(_fmp_enr)} → {', '.join(_fmp_enr[:5])}" + (" …" if len(_fmp_enr) > 5 else ""))
-    elif _fmp_meta.get("error"):
-        _bits.append(f"⚠ FMP gagal: {_fmp_meta['error']}")
-    elif _fmp_meta.get("note", "").startswith("FMP_API_KEY"):
-        _bits.append("⚪ FMP nonaktif (free tier FMP tak punya economic calendar)")
-    for _b in _bits:
-        st.caption(_b)
+        st.caption("ℹ️ Belum ada event released minggu ini. Surprise → R_hard aktif begitu ada actual "
+                   "(faireconomy) pada indikator yang dikenal sigma_table.")
     if calendar_data.get("_error") and not events:
         st.warning(f"Calendar fetch gagal: {calendar_data['_error']}")
         return
@@ -1314,29 +1252,22 @@ def main() -> None:
         # Calendar dulu — diperlukan oleh macro untuk surprises
         calendar_data = cached_get_calendar()
 
-        # Isi `actual` event US dari FRED (faireconomy tidak kasih actual).
+        # SURPRISE ENRICHMENT (lean Modul A — koreksi premis handover):
+        #   `actual` BUKAN yang hilang — calendar_evt sudah mem-parse actual dari feed
+        #   faireconomy. Yang hilang adalah σ (historical_std). engine/sigma_table.py
+        #   mengisi historical_std + surprise_polarity + actual_source untuk indikator
+        #   high-impact yang dikenal. Karena actual+forecast dua-duanya dari feed yang
+        #   SAMA, unit konsisten otomatis (tak ada unit-matching landmine).
+        #   Keanggotaan tabel = gate scoring; indikator tak dikenal tetap display-only.
+        #   σ = SEED PLACEHOLDER → ganti dgn σ terukur dari histori + backtest.
         import json
-        _enrich = cached_enrich_us(json.dumps(calendar_data.get("events", [])))
-        calendar_data = dict(calendar_data)                 # salinan dangkal (jangan mutasi cache)
-        calendar_data["events"] = _enrich.get("events", calendar_data.get("events", []))
-        calendar_data["_us_enriched"] = _enrich.get("enriched", [])
-        calendar_data["_us_meta"] = _enrich.get("_meta", {})
 
-        # Lapisan DBnomics (gratis, tanpa key): isi actual NON-US (EUR dulu) — IKUT skor (ber-σ).
-        _world = cached_enrich_world(json.dumps(calendar_data.get("events", [])))
-        calendar_data["events"] = _world.get("events", calendar_data.get("events", []))
-        calendar_data["_world_enriched"] = _world.get("enriched", [])
-        calendar_data["_world_meta"] = _world.get("_meta", {})
+        _surprise_diag = enrich_surprise_fields(calendar_data.get("events", []))
+        calendar_data["_surprise_diag"] = _surprise_diag
 
-        # Lapisan FMP (opsional, key-gated): isi actual sisanya (ISM dll) — DISPLAY ONLY.
-        _fmp = cached_enrich_fmp(json.dumps(calendar_data.get("events", [])))
-        calendar_data["events"] = _fmp.get("events", calendar_data.get("events", []))
-        calendar_data["_fmp_enriched"] = _fmp.get("enriched", [])
-        calendar_data["_fmp_meta"] = _fmp.get("_meta", {})
-
-        # Released events → surprises untuk macro.
-        # ATURAN DISIPLIN: HANYA event ber-σ (historical_std, dari FRED) yang menggerakkan
-        # skor. Actual dari FMP (tanpa σ) sengaja DIKECUALIKAN dari skor → display-only.
+        # Released events → surprises untuk macro. Lolos hanya bila actual ADA
+        # (dari faireconomy) DAN σ ter-set (dikenal sigma_table). build_surprises
+        # → z=(actual−forecast)/σ ×polarity → R_hard (decay 2 hari), tertelusur di Detail Skor.
         released_events = [
             e for e in calendar_data.get("events", [])
             if e.get("status") == "released"
