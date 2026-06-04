@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: Modul A #2 LIVE — manual actual input + Groq-vision screenshot pre-fill (cross-check guard) + Modul B Groq + Eurostat + sigma_table (2026-06-04e)
+# QF_BIAS_BUILD: 2 sentiment (COT lagging + myfxbook live via faktor D) + retail myfxbook-only + dumb-money + manual actual + Groq (2026-06-04g)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -1253,6 +1253,8 @@ def render_key_risk_events(calendar_data: dict) -> None:
 def render_score_detail(
     asset_bias_map: dict[str, dict],
     news_delta: dict[str, float],
+    cot_data: dict | None = None,
+    retail_data: dict | None = None,
 ) -> None:
     """Tab Detail Skor: breakdown lengkap perhitungan bias satu currency terpilih."""
 
@@ -1342,7 +1344,38 @@ def render_score_detail(
             f"(COT makin lama sejak snapshot Selasa → bobotnya makin kecil, bukan skornya.)"
         )
 
-    # --- Rumus eksplisit ---
+    # --- DUA SENTIMENT berdampingan: COT (lagging) + myfxbook (live) ---
+    cot_slot = (cot_data or {}).get("cot", {}).get(sel, {}) if cot_data else {}
+    dumb_net = cot_slot.get("dumb_net")
+    if dumb_net is not None:
+        dumb_idx = cot_slot.get("dumb_index")
+        lean = "net-LONG" if dumb_net > 0 else ("net-SHORT" if dumb_net < 0 else "flat")
+        idx_txt = f" · index {dumb_idx}/100" if dumb_idx is not None else ""
+        div = cot_slot.get("smart_dumb_divergence")
+        div_txt = (" &nbsp;<span style='color:#d97706;font-weight:700;'>⚠ divergence vs smart money "
+                   "(setup kontrarian — display saja, belum di-score)</span>") if div else ""
+        st.caption(
+            f"🐑 **Dumb money — COT non-reportable (lagging, snapshot Selasa):** {sel} {lean} "
+            f"({dumb_net:+,}){idx_txt}.{div_txt}",
+            unsafe_allow_html=True,
+        )
+    # Retail live (myfxbook): pair yang melibatkan sel + long% (kontrarian feeds faktor D)
+    retail_map = (retail_data or {}).get("retail", {}) if retail_data else {}
+    rel_pairs = {p: v for p, v in retail_map.items()
+                 if isinstance(p, str) and sel in p and sel not in ("XAU", "BTC", "ETH")}
+    if rel_pairs:
+        parts = []
+        for p, v in sorted(rel_pairs.items()):
+            lp = v.get("long_pct_agg") if isinstance(v, dict) else None
+            if lp is not None:
+                parts.append(f"{p} {lp:.0f}%L")
+        if parts:
+            st.caption("📊 **Retail live — myfxbook (feeds faktor D, kontrarian):** "
+                       + " · ".join(parts) + " &nbsp;<span style='color:#6b7280;'>(% retail net-long; "
+                       "ekstrem = sinyal fade)</span>", unsafe_allow_html=True)
+    elif retail_data is not None and not retail_map:
+        st.caption("📊 Retail live (myfxbook): kosong — set `MYFXBOOK_EMAIL`+`MYFXBOOK_PASSWORD` "
+                   "di Secrets, atau IP Streamlit terblokir (cek status sumber).")
     with st.expander("📐 Rumus & cara baca"):
         _rumus_lines = [
             "- **Tiap faktor** menghasilkan *score* ∈ [−1, +1] (lihat kolom Penjelasan untuk asal angkanya).",
@@ -1661,7 +1694,7 @@ def main() -> None:
 
     with tab_detail:
         try:
-            render_score_detail(asset_bias_map, news_delta_map)
+            render_score_detail(asset_bias_map, news_delta_map, cot_data, retail_data)
         except Exception as exc:
             st.error(f"Detail Skor error: {exc}")
 
