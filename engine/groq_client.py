@@ -154,3 +154,79 @@ def classify_headline(headline: str, api_key: str,
             logger.debug("Groq attempt %d gagal: %s", attempt + 1, exc)
     logger.warning("Groq classify gagal final: %s", last_err)
     return None
+
+
+_VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
+_VISION_SYSTEM = (
+    "You read an economic-calendar screenshot (ForexFactory). Extract EVERY visible row "
+    "as structured data. For each row output: currency (3-letter, e.g. USD/EUR/JPY), "
+    "event (the event name text), actual, forecast, previous (copy the displayed strings "
+    "verbatim, e.g. '122K','0.3%','-8.0M'; use empty string if a cell is blank/'–'). "
+    "Do NOT interpret, invent, or compute — only transcribe what is shown. "
+    'Output ONLY JSON: {"rows":[{"currency":"USD","event":"ISM Services PMI","actual":"54.5","forecast":"53.7","previous":"53.6"}]}'
+)
+
+
+def extract_calendar_image(image_b64: str, api_key: str,
+                           media_type: str = "image/png", timeout: int = 40) -> list[dict] | None:
+    """
+    Groq Scout (vision) baca screenshot kalender → list baris mentah
+    [{currency,event,actual,forecast,previous}] (string apa adanya) atau None.
+    Hanya TRANSKRIPSI; pencocokan + cross-check dilakukan engine/manual_actuals.
+    None = gagal → user input manual. Tidak pernah raise.
+    """
+    if not image_b64 or not api_key:
+        return None
+    payload = {
+        "model": _VISION_MODEL,
+        "messages": [
+            {"role": "system", "content": _VISION_SYSTEM},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Transcribe all calendar rows to JSON."},
+                {"type": "image_url",
+                 "image_url": {"url": f"data:{media_type};base64,{image_b64}"}},
+            ]},
+        ],
+        "temperature": 0,
+        "max_tokens": 2000,
+        "response_format": {"type": "json_object"},
+    }
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    try:
+        resp = requests.post(_ENDPOINT, json=payload, headers=headers, timeout=timeout)
+        if resp.status_code == 429:
+            logger.warning("Groq vision rate-limited (429)")
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        obj = parse_groq_json(content) if False else _loads_rows(content)
+        return obj
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Groq vision gagal: %s", exc)
+        return None
+
+
+def _loads_rows(content: str) -> list[dict] | None:
+    """Parse {'rows':[...]} dari balasan vision (defensif)."""
+    if not content:
+        return None
+    s = content.strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        if s[:4].lower() == "json":
+            s = s[4:]
+        s = s.strip()
+    if not s.startswith("{"):
+        i, j = s.find("{"), s.rfind("}")
+        if i == -1 or j == -1:
+            return None
+        s = s[i:j + 1]
+    try:
+        obj = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    rows = obj.get("rows") if isinstance(obj, dict) else None
+    if not isinstance(rows, list):
+        return None
+    return [r for r in rows if isinstance(r, dict)]
