@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: myfxbook keep-alive session + optional fixed-IP proxy (IP-bound session fix attempt) + retail diag (2026-06-04i)
+# QF_BIAS_BUILD: A1 EdgeFinder 9-endpoint parsers + Data Feeds A1 section + rates=CPI bug guard + ref doc (2026-06-04k)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -1487,6 +1487,154 @@ def build_sources_status(
     return status
 
 
+def render_data_feeds() -> None:
+    """Panel click-to-run parse.bot — tarik data hanya saat tombol diklik (hemat kredit)."""
+    from collectors import parsebot_client as pb
+
+    st.subheader("🛰️ Data Feeds — parse.bot (click-to-run)")
+    has_key = pb._api_key() is not None
+    calls = pb.calls_this_session()
+    c1, c2 = st.columns([3, 1])
+    with c1:
+        st.caption(
+            "Data **tidak** ditarik otomatis — hanya saat kamu klik tombol, jadi kredit "
+            "tidak habis liar. Klik ulang dalam masa cache = **0 kredit** (serve dari cache)."
+        )
+    with c2:
+        st.metric("Call sesi ini", calls)
+    if not has_key:
+        st.warning("Set `PARSE_API_KEY` di Streamlit Secrets dulu untuk pakai panel ini.")
+    st.caption(
+        "💳 Budget free tier ~200 kredit/bln (verifikasi di dashboard-mu; buat scraper ~75, "
+        "edit ~50; call situs anti-bot BISA >1 kredit). Rencana hemat di bawah."
+    )
+    st.divider()
+
+    # --- 1) ForexFactory: kalender minggu ini (actual/forecast/previous) ---
+    st.markdown("**📅 Kalender ForexFactory (minggu ini)** — 1 call = seluruh minggu. Cache 6 jam.")
+    if st.button("Tarik kalender minggu ini", key="pb_ff", disabled=not has_key):
+        try:
+            with st.spinner("Mengambil kalender FF…"):
+                resp = pb.fetch(pb.SCRAPERS["forexfactory"], "get_calendar", {}, ttl=21_600)
+            st.session_state["pb_ff_data"] = pb.parse_ff_calendar(resp)
+            st.session_state["pb_ff_ts"] = _now_wib_str()
+        except Exception as exc:
+            st.error(f"FF gagal: {exc}")
+    ff = st.session_state.get("pb_ff_data")
+    if ff:
+        st.caption(f"Ditarik: {st.session_state.get('pb_ff_ts','-')} · {len(ff)} event")
+        released = [e for e in ff if str(e.get("actual", "")).strip()]
+        st.caption(f"Sudah rilis (ada actual): {len(released)} event")
+        st.dataframe(
+            [{"Mata Uang": e["currency"], "Event": e["name"], "Impact": e["impact"],
+              "Actual": e["actual"], "Forecast": e["forecast"], "Previous": e["previous"],
+              "Waktu": f'{e["date"]} {e["time"]}'} for e in ff[:80]],
+            use_container_width=True, hide_index=True,
+        )
+
+    st.divider()
+    # --- 2) myfxbook: suku bunga bank sentral (untuk benerin rate_diff mayor) ---
+    st.markdown("**🏦 Suku bunga bank sentral (myfxbook)** — jarang berubah. Cache 24 jam.")
+    if st.button("Tarik suku bunga", key="pb_rates", disabled=not has_key):
+        try:
+            with st.spinner("Mengambil suku bunga…"):
+                resp = pb.fetch(pb.SCRAPERS["myfxbook"], "get_interest_rates", {}, ttl=86_400)
+            st.session_state["pb_rates_data"] = pb.parse_myfxbook_rates(resp)
+            st.session_state["pb_rates_ts"] = _now_wib_str()
+        except Exception as exc:
+            st.error(f"Rates gagal: {exc}")
+    rates = st.session_state.get("pb_rates_data")
+    if rates:
+        st.caption(f"Ditarik: {st.session_state.get('pb_rates_ts','-')} · {len(rates)} bank")
+        st.dataframe(
+            [{"Bank": r["bank"], "Negara": r["country"], "Rate": r["current_rate"],
+              "Sebelum": r["previous_rate"], "Δ": r["change"], "Rapat terakhir": r["last_meeting"]}
+             for r in rates],
+            use_container_width=True, hide_index=True,
+        )
+
+    st.divider()
+    # --- 3) A1 EdgeFinder (scraper custom) — sumber utama sentiment/COT/strength ---
+    st.markdown("**🛰️ A1 EdgeFinder** — retail sentiment, COT, currency strength. Cache 1-6 jam.")
+    a1 = pb.SCRAPERS["a1edge"]
+    cols = st.columns(4)
+    with cols[0]:
+        if st.button("Retail sentiment", key="a1_retail", disabled=not has_key):
+            try:
+                with st.spinner("…"):
+                    st.session_state["a1_retail_data"] = pb.parse_a1_retail(
+                        pb.fetch(a1, "get_retail_sentiment", {}, ttl=3_600))
+                    st.session_state["a1_retail_ts"] = _now_wib_str()
+            except Exception as exc:
+                st.error(f"retail: {exc}")
+    with cols[1]:
+        if st.button("COT (smart)", key="a1_cot", disabled=not has_key):
+            try:
+                with st.spinner("…"):
+                    st.session_state["a1_cot_data"] = pb.parse_a1_cot(
+                        pb.fetch(a1, "get_cot_report", {}, ttl=21_600))
+                    st.session_state["a1_cot_ts"] = _now_wib_str()
+            except Exception as exc:
+                st.error(f"cot: {exc}")
+    with cols[2]:
+        if st.button("Currency strength", key="a1_heat", disabled=not has_key):
+            try:
+                with st.spinner("…"):
+                    st.session_state["a1_heat_data"] = pb.parse_a1_strength(
+                        pb.fetch(a1, "get_currency_heatmap", {}, ttl=3_600))
+                    st.session_state["a1_heat_ts"] = _now_wib_str()
+            except Exception as exc:
+                st.error(f"heatmap: {exc}")
+    with cols[3]:
+        if st.button("Rates (⚠cek bug)", key="a1_rates", disabled=not has_key):
+            try:
+                with st.spinner("…"):
+                    rr = pb.fetch(a1, "get_interest_rates", {}, ttl=86_400)
+                    ii = pb.fetch(a1, "get_inflation_data", {}, ttl=86_400)
+                    st.session_state["a1_rates_data"] = pb.parse_a1_rates(rr)
+                    st.session_state["a1_rates_dupe"] = pb.rates_look_like_cpi(rr, ii)
+                    st.session_state["a1_rates_ts"] = _now_wib_str()
+            except Exception as exc:
+                st.error(f"rates: {exc}")
+
+    rd = st.session_state.get("a1_retail_data")
+    if rd and rd.get("per_currency"):
+        st.caption(f"Retail per mata uang · {st.session_state.get('a1_retail_ts','-')} "
+                   "— kita pakai **long% mentah** (engine hitung kontrarian); 'signal' = display saja.")
+        st.dataframe(
+            [{"CCY": c, "Long %": v["long_pct"], "Short %": v["short_pct"],
+              "A1 signal": v["signal"]} for c, v in rd["per_currency"].items()],
+            use_container_width=True, hide_index=True)
+    ct = st.session_state.get("a1_cot_data")
+    if ct:
+        st.caption(f"COT non-commercial (smart money) · {st.session_state.get('a1_cot_ts','-')} "
+                   "— ⚠ overlap dgn collector CFTC; pilih satu, jangan double-count.")
+        st.dataframe(
+            [{"Asset": a, "Long %": v["long_pct"], "Short %": v["short_pct"], "Net %": v["net_pct"]}
+             for a, v in ct.items()], use_container_width=True, hide_index=True)
+    ht = st.session_state.get("a1_heat_data")
+    if ht:
+        st.caption(f"Currency strength (Δ% harga 1 hari) · {st.session_state.get('a1_heat_ts','-')} "
+                   "— **lensa price/TA terpisah, BUKAN faktor bias**. Untuk divergensi bias-vs-harga.")
+        st.dataframe(
+            [{"CCY": c, "Strength (avg Δ%)": s} for c, s in
+             sorted(ht.items(), key=lambda kv: kv[1], reverse=True)],
+            use_container_width=True, hide_index=True)
+    ra = st.session_state.get("a1_rates_data")
+    if ra:
+        if st.session_state.get("a1_rates_dupe"):
+            st.error("🚨 get_interest_rates = duplikat CPI (bug scraper). JANGAN pakai untuk "
+                     "rate_diff — akan korupsi R_hard. Perbaiki endpoint di parse.bot dulu.")
+        st.dataframe(
+            [{"CCY": r["currency"], "Rate?": r["current_rate"], "Prev?": r["previous_rate"],
+              "Bank": r["bank"]} for r in ra], use_container_width=True, hide_index=True)
+
+
+def _now_wib_str() -> str:
+    from datetime import datetime, timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M WIB")
+
+
 def main() -> None:
     """Entry point Streamlit — satu rerun = satu siklus data pipeline + display."""
 
@@ -1683,12 +1831,13 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # STEP 7 — Tabs display
     # -----------------------------------------------------------------------
-    tab_board, tab_pairs, tab_detail, tab_news, tab_events = st.tabs([
+    tab_board, tab_pairs, tab_detail, tab_news, tab_events, tab_feeds = st.tabs([
         "📈 Bias Board",
         "🔍 Pair Scanner",
         "🔬 Detail Skor",
         "📰 News Feed",
         "⏰ Risk Events",
+        "🛰️ Data Feeds",
     ])
 
     with tab_board:
@@ -1720,6 +1869,12 @@ def main() -> None:
             render_key_risk_events(calendar_data)
         except Exception as exc:
             st.error(f"Key Risk Events error: {exc}")
+
+    with tab_feeds:
+        try:
+            render_data_feeds()
+        except Exception as exc:
+            st.error(f"Data Feeds error: {exc}")
 
     # -----------------------------------------------------------------------
     # STEP 8 — Footer
