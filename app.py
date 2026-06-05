@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: COT tab — kartu A1 (format sama _sentiment_card) setelah generate + tabel confidence A1-vs-CFTC metavulus dgn kolom Kesimpulan (SEARAH naik/BEDA turun, display-only) + Risk Events kalender restyle baris metavulus (2026-06-04v)
+# QF_BIAS_BUILD: COT tab CFTC|A1 tersanding per aset (grouped Currency/Komoditas/Crypto/Index) + indikator SEARAH/BEDA + ringkasan; Retail dikelompokkan per kelas; fix badge COT dobel (1 badge, hijau hanya kalau CFTC net ada) (2026-06-04w)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -173,6 +173,19 @@ st.markdown("""
 .qf-cal .afp { color:#8b97a7; font-size:0.74rem; }
 .qf-imp-h { color:#f87171; font-weight:700; } .qf-imp-m { color:#f59e0b; font-weight:700; }
 .qf-imp-l { color:#6b7280; font-weight:600; }
+/* COT side-by-side CFTC | A1 */
+.qf-grp { color:#9aa6b6; font-weight:800; font-size:0.84rem; letter-spacing:.04em; text-transform:uppercase;
+          margin:16px 0 6px; }
+.qf-cmp { display:grid; grid-template-columns:74px 1fr 104px 1fr; gap:12px; align-items:center;
+          padding:12px 14px; border-bottom:1px solid #161c25; }
+.qf-cmp.head { color:#64748b; font-size:0.64rem; letter-spacing:.05em; text-transform:uppercase;
+               font-weight:700; border-bottom:1px solid #243041; }
+.qf-cmpname { font-weight:800; color:#e2e8f0; font-size:0.92rem; }
+.qf-side-h { color:#5b6677; font-size:0.58rem; text-transform:uppercase; letter-spacing:.07em; font-weight:700; }
+.qf-side-m { color:#8b97a7; font-size:0.72rem; margin-top:1px; }
+.qf-lsbar { height:6px; border-radius:4px; overflow:hidden; display:flex; margin-top:4px; }
+.qf-ls { color:#5b6677; font-size:0.66rem; margin-top:2px; }
+.qf-align { text-align:center; font-weight:800; font-size:0.74rem; }
 </style>""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
@@ -1761,122 +1774,172 @@ def render_retail_tab() -> None:
         elif name in _A1_INSTRUMENT_MAP:
             disp, tag = _A1_INSTRUMENT_MAP[name]
             items.append((disp, name, tag, lp, v.get("short_pct")))
-    # urut by conviction (|long-50|) desc
+    # urut by conviction (|long-50|) desc lalu kelompokkan per kelas
     items.sort(key=lambda x: abs((x[3] or 50) - 50), reverse=True)
-    for i, (disp, sub, tag, lp, sp) in enumerate(items, 1):
-        st.markdown(_sentiment_card(i, disp, sub, tag, lp, sp, mode="fade"),
-                    unsafe_allow_html=True)
+    _order = [("FOREX", "Currency"), ("KOMODITAS", "Komoditas"),
+              ("CRYPTO", "Crypto"), ("INDEX", "Index")]
+    rank = 0
+    for tagkey, gname in _order:
+        grp = [it for it in items if it[2] == tagkey]
+        if not grp:
+            continue
+        st.markdown(f'<div class="qf-grp">{gname}</div>', unsafe_allow_html=True)
+        for disp, sub, tag, lp, sp in grp:
+            rank += 1
+            st.markdown(_sentiment_card(rank, disp, sub, tag, lp, sp, mode="fade"),
+                        unsafe_allow_html=True)
+    # sisa tag lain (jaga-jaga)
+    shown = {t for t, _ in _order}
+    rest = [it for it in items if it[2] not in shown]
+    if rest:
+        st.markdown('<div class="qf-grp">Lainnya</div>', unsafe_allow_html=True)
+        for disp, sub, tag, lp, sp in rest:
+            rank += 1
+            st.markdown(_sentiment_card(rank, disp, sub, tag, lp, sp, mode="fade"),
+                        unsafe_allow_html=True)
+
+
+_COT_CANON_ALIAS = {"XAU": "GOLD", "GOLD": "GOLD", "BITCOIN": "BTC", "ETHEREUM": "ETH",
+                    "USOIL": "USOIL", "USOĪL": "USOIL"}
+_COT_GROUPS = [
+    ("Currency", {"USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF", "ZAR"}),
+    ("Komoditas", {"GOLD", "SILVER", "PLATINUM", "COPPER", "USOIL"}),
+    ("Crypto", {"BTC", "ETH"}),
+    ("Index / Rates", {"SPX", "NASDAQ", "DOW", "RUSSELL", "NIKKEI", "US10T"}),
+]
+
+
+def _cot_canon(k: str) -> str:
+    u = str(k).upper()
+    return _COT_CANON_ALIAS.get(u, u)
+
+
+def _cot_dir(slot: dict | None):
+    """Arah net: +1 long, −1 short, 0 netral, None tak ada."""
+    if not slot:
+        return None
+    if slot.get("net") is not None:
+        return 1 if slot["net"] > 0 else (-1 if slot["net"] < 0 else 0)
+    if slot.get("net_pct") is not None:
+        return 1 if slot["net_pct"] > 0 else (-1 if slot["net_pct"] < 0 else 0)
+    lp = slot.get("long_pct")
+    if lp is not None:
+        return 1 if lp > 50 else (-1 if lp < 50 else 0)
+    return None
+
+
+def _cot_side_html(src: str, slot: dict | None) -> str:
+    if not slot or _cot_dir(slot) is None and slot.get("long_pct") is None:
+        return f'<div><div class="qf-side-h">{src}</div><div class="qf-neu">— tak ada</div></div>'
+    lp = slot.get("long_pct")
+    sp = slot.get("short_pct")
+    if lp is not None:
+        sp = sp if sp is not None else (100 - lp)
+        if abs(lp - 50) < 10:
+            read, rc = "Netral", "#9aa6b6"
+        elif lp >= 50:
+            read, rc = "Net-long", "#22c55e"
+        else:
+            read, rc = "Net-short", "#f97316"
+    else:
+        d = _cot_dir(slot)
+        read, rc = ("Net-long", "#22c55e") if d == 1 else (
+            ("Net-short", "#f97316") if d == -1 else ("Netral", "#9aa6b6"))
+    metric = ""
+    if slot.get("net") is not None:
+        metric = f"net {slot['net']:+,}"
+        if slot.get("cot_index") is not None:
+            metric += f" · idx {slot['cot_index']:.0f}"
+    elif slot.get("net_pct") is not None:
+        metric = f"net {slot['net_pct']:+.2f}%"
+    bar = ""
+    if lp is not None:
+        bar = (f'<div class="qf-lsbar"><div style="width:{lp}%;background:#22c55e;"></div>'
+               f'<div style="width:{sp}%;background:#f97316;"></div></div>'
+               f'<div class="qf-ls">L {lp:.0f}% · S {sp:.0f}%</div>')
+    return (f'<div><div class="qf-side-h">{src}</div>'
+            f'<div style="color:{rc};font-weight:700;font-size:0.82rem;">{read}</div>'
+            f'<div class="qf-side-m">{metric or "—"}</div>{bar}</div>')
 
 
 def render_cot_tab(cot_data: dict | None = None) -> None:
-    """Tab COT — CFTC (gratis, sumber utama faktor C) + validasi A1 opsional (tarik kredit)."""
-    st.subheader("🏛️ COT — CFTC TFF (gratis)")
-    st.caption("Sumber utama: **CFTC TFF Leveraged Funds — GRATIS, tanpa kredit parse.bot**. "
-               "Non-commercial = smart money → dibaca **searah** (ikut), bukan fade.")
-    st.caption("🗓️ **Mingguan & lagging**: snapshot Selasa, rilis Jumat ~15:30 ET.")
+    """Tab COT — CFTC (gratis) & A1 (validasi) tersanding per aset + indikator searah."""
+    st.subheader("🏛️ COT — CFTC vs A1 (smart money)")
+    st.caption("**CFTC TFF Leveraged Funds** = sumber utama (gratis, masuk skor faktor C). "
+               "**A1** = CFTC Legacy non-commercial (kategori beda) → **cek arah saja, tidak masuk skor**. "
+               "Non-commercial dibaca **searah** (ikut), bukan fade. Mingguan & lagging: snapshot Selasa, "
+               "rilis Jumat ~15:30 ET. Generate A1 di bawah untuk menyandingkan.")
 
     cftc = (cot_data or {}).get("cot", {}) if cot_data else {}
-    items = []
-    for asset, v in cftc.items():
-        if not isinstance(v, dict) or v.get("_error") or v.get("long_pct") is None:
-            continue
-        tag = ("CRYPTO" if asset in ("BTC", "ETH")
-               else "KOMODITAS" if asset in ("XAU", "Gold", "SILVER") else "FOREX (futures)")
-        extra = ""
-        if v.get("net") is not None:
-            extra += f" · net {v['net']:+,}"
-        if v.get("cot_index") is not None:
-            extra += f" · COT idx {v['cot_index']:.0f}/100"
-        items.append((asset, asset, tag, v["long_pct"], v.get("short_pct"), extra))
-    if not items:
-        st.info("Data COT CFTC belum termuat (cek badge COT di header). XAU/emas tidak ada di TFF "
-                "— pakai validasi A1 di bawah untuk emas.")
-    else:
-        items.sort(key=lambda x: abs((x[3] or 50) - 50), reverse=True)
-        for i, (disp, sub, tag, lp, sp, extra) in enumerate(items, 1):
-            st.markdown(_sentiment_card(i, disp, sub, tag, lp, sp, mode="follow", extra=extra),
-                        unsafe_allow_html=True)
 
-    # --- Validasi silang A1 COT (display-only; TIDAK memengaruhi engine) ---
-    st.divider()
-    st.markdown("#### 🔎 Validasi silang A1 COT")
     pb = _get_pb()
     has_key = pb is not None and pb._api_key() is not None
-    st.caption("A1 = CFTC Legacy **non-commercial** (kategori beda dari TFF). **Cek arah** saja — "
-               "TIDAK masuk skor (skor pakai CFTC). Cukup 1× setelah Jumat (cache 24 jam).")
-    if pb is None:
-        st.error("Modul `parsebot_client.py` belum ada di collectors/.")
-    if st.button("Generate A1 COT (validasi)", key="cot_a1_validate", disabled=not has_key):
-        try:
-            with st.spinner("…"):
-                st.session_state["a1_cot_data"] = pb.parse_a1_cot(
-                    pb.fetch(pb.SCRAPERS["a1edge"], "get_cot_report", {}, ttl=86_400))
-                st.session_state["a1_cot_ts"] = _now_wib_str()
-        except Exception as exc:
-            st.error(f"A1 COT: {exc}")
-    if pb is not None and not has_key:
-        st.warning("Set `PARSE_API_KEY` di Secrets untuk pakai validasi A1.")
+    bcol1, _ = st.columns([2, 5])
+    with bcol1:
+        if st.button("🔄 Generate / refresh A1 COT", key="cot_a1_validate", disabled=not has_key,
+                     use_container_width=True):
+            try:
+                with st.spinner("…"):
+                    st.session_state["a1_cot_data"] = pb.parse_a1_cot(
+                        pb.fetch(pb.SCRAPERS["a1edge"], "get_cot_report", {}, ttl=86_400))
+                    st.session_state["a1_cot_ts"] = _now_wib_str()
+            except Exception as exc:
+                st.error(f"A1 COT: {exc}")
+    if not has_key:
+        st.caption("⚠️ Set `PARSE_API_KEY` di Secrets untuk generate A1.")
+    a1 = st.session_state.get("a1_cot_data") or {}
 
-    a1 = st.session_state.get("a1_cot_data")
-    if not a1:
-        st.info("Belum generate A1 COT. Klik tombol di atas (cache 24 jam, 0 kredit saat klik ulang).")
+    cftc_c = {_cot_canon(k): v for k, v in cftc.items()
+              if isinstance(v, dict) and not v.get("_error")}
+    a1_c = {_cot_canon(k): v for k, v in a1.items() if isinstance(v, dict)}
+
+    if not cftc_c and not a1_c:
+        st.info("CFTC belum termuat (cek badge COT) & A1 belum di-generate. "
+                "Kalau CFTC kosong padahal harusnya ada → re-upload `collectors/cot.py` (versi terbaru "
+                "menambah long%/short% untuk kartu).")
         return
-    st.caption(f"A1 update: {st.session_state.get('a1_cot_ts','-')}")
+    if cftc_c and not any(v.get("long_pct") is not None for v in cftc_c.values()):
+        st.caption("ℹ️ CFTC ada arah (net) tapi tanpa long%/short% → **re-upload `collectors/cot.py`** "
+                   "untuk bar long/short. Arah & perbandingan tetap jalan.")
 
-    # Kartu A1 — format sama persis dengan kartu CFTC/retail (mode follow)
-    st.markdown("**Kartu A1 (non-commercial = smart money)**")
-    a1_items = []
-    for asset, v in a1.items():
-        lp = v.get("long_pct")
-        if lp is None:
+    ts_a1 = st.session_state.get("a1_cot_ts")
+    if a1_c and ts_a1:
+        st.caption(f"A1 update: {ts_a1}")
+
+    agree = total = 0
+    all_canon = set(cftc_c) | set(a1_c)
+    for gname, gset in _COT_GROUPS:
+        members = [c for c in all_canon if c in gset]
+        if not members:
             continue
-        if asset in _FOREX_CCY:
-            tag = "FOREX"
-        elif asset in ("Gold", "XAU", "SILVER", "PLATINUM", "COPPER", "USOil", "USOIL"):
-            tag = "KOMODITAS"
-        elif asset in ("BTC", "ETH"):
-            tag = "CRYPTO"
-        else:
-            tag = "INDEX"
-        a1_items.append((asset, tag, lp, v.get("short_pct")))
-    a1_items.sort(key=lambda x: abs((x[2] or 50) - 50), reverse=True)
-    for i, (disp, tag, lp, sp) in enumerate(a1_items, 1):
-        st.markdown(_sentiment_card(i, disp, disp, tag, lp, sp, mode="follow"),
-                    unsafe_allow_html=True)
-
-    # Tabel confidence modulation A1 vs CFTC (display-only)
-    if cftc:
-        agree = total = 0
-        body = ('<div class="qf-cotrow head"><span>CCY</span><span>CFTC net</span>'
-                '<span>A1 net%</span><span>Arah</span><span>Kesimpulan</span></div>')
-        for ccy in sorted(_FOREX_CCY):
-            av = a1.get(ccy)
-            ov = cftc.get(ccy)
-            if not (av and ov and ov.get("net") is not None and av.get("net_pct") is not None):
-                continue
-            total += 1
-            same = (av["net_pct"] >= 0) == (ov["net"] >= 0)
-            agree += 1 if same else 0
-            if same:
-                arah = '<span class="qf-pos">● sama</span>'
-                kes = '<span class="qf-pos" style="font-weight:600;">SEARAH → confidence naik</span>'
+        members.sort()
+        st.markdown(f'<div class="qf-grp">{gname}</div>', unsafe_allow_html=True)
+        body = ('<div class="qf-cmp head"><span>Aset</span><span>CFTC (utama)</span>'
+                '<span>Arah</span><span>A1 (validasi)</span></div>')
+        for c in members:
+            cs = cftc_c.get(c)
+            asl = a1_c.get(c)
+            cd, ad = _cot_dir(cs), _cot_dir(asl)
+            if cd is not None and ad is not None and cd != 0 and ad != 0:
+                total += 1
+                same = cd == ad
+                agree += 1 if same else 0
+                align = ('<span class="qf-pos qf-align">● SEARAH</span>' if same
+                         else '<span class="qf-neg qf-align">▲ BEDA</span>')
             else:
-                arah = '<span class="qf-neg">▲ beda</span>'
-                kes = '<span class="qf-neg" style="font-weight:600;">BEDA → confidence turun</span>'
+                align = '<span class="qf-neu qf-align">—</span>'
             body += (
-                f'<div class="qf-cotrow"><span class="qf-pair">{ccy}</span>'
-                f'<span class="qf-pnote">{ov["net"]:+,}</span>'
-                f'<span class="qf-pnote">{av["net_pct"]:+.2f}</span>'
-                f'<span style="font-size:0.82rem;">{arah}</span>'
-                f'<span style="font-size:0.8rem;">{kes}</span></div>'
+                f'<div class="qf-cmp"><span class="qf-cmpname">{c}</span>'
+                f'{_cot_side_html("CFTC", cs)}{align}{_cot_side_html("A1", asl)}</div>'
             )
-        if total:
-            pct = round(100 * agree / total)
-            st.markdown(f"**Confidence modulation A1 ↔ CFTC** — searah **{agree}/{total} ({pct}%)**. "
-                        "_Kolom kesimpulan = arah saja; display/validasi, belum memengaruhi engine._")
-            st.markdown(f'<div class="qf-wrap">{body}</div>', unsafe_allow_html=True)
-        else:
-            st.caption("Tidak ada CCY yang cocok antara A1 & CFTC untuk dibandingkan.")
+        st.markdown(f'<div class="qf-wrap">{body}</div>', unsafe_allow_html=True)
+
+    if total:
+        pct = round(100 * agree / total)
+        verd = "mantap, sumber sepakat." if pct >= 80 else (
+            "ada divergensi — cek event/kategori." if pct < 60 else "mayoritas sepakat.")
+        st.markdown(f"**Searah CFTC ↔ A1: {agree}/{total} ({pct}%)** — {verd} "
+                    "_Arah saja; A1 tidak memengaruhi skor (skor pakai CFTC)._")
 
 
 def render_risk_events_ff(calendar_data: dict) -> None:
@@ -2289,12 +2352,13 @@ def main() -> None:
     _has_a1_retail = bool((st.session_state.get("a1_retail_data") or {}).get("per_currency"))
     _has_a1_cot = bool(st.session_state.get("a1_cot_data"))
     _has_ff = bool(st.session_state.get("pb_ff_data"))
-    sources_status["cot"] = "ok"                                   # CFTC selalu ada
+    # COT: pakai status ASLI dari build_sources_status (hijau hanya kalau CFTC net ada);
+    # cuma tambah label A1 kalau A1 sudah di-generate. (Satu badge, tidak dobel.)
     sources_status["retail"] = "ok" if _has_a1_retail else "fail"  # A1 belum ditarik → merah
     sources_status["news"] = "ok"                                  # selalu ada
     sources_status["calendar"] = "ok" if _has_ff else "fail"       # FF belum ditarik → merah
     labels = {
-        "cot": "COT (CFTC + A1)" if _has_a1_cot else "COT (CFTC)",
+        "COT": "COT (CFTC + A1)" if _has_a1_cot else "COT (CFTC)",
         "retail": "retail (A1)" if _has_a1_retail else "retail (tarik A1)",
         "calendar": "calendar (FF)" if _has_ff else "calendar (tarik FF)",
         "news": "news",
