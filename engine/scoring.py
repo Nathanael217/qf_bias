@@ -78,9 +78,10 @@ Diff > 5pp diperlakukan sebagai sinyal penuh.
 
 # Bobot crypto-khusus — PLACEHOLDER (arsitektur §3 Crypto)
 _CRYPTO_WEIGHTS: dict[str, float] = {
-    "R_hard": 0.20,    # PLACEHOLDER — rate tidak langsung drive crypto
-    "C": 0.40,         # PLACEHOLDER — COT CME BTC lebih relevan untuk crypto
+    "R_hard": 0.15,    # PLACEHOLDER — rate tidak langsung drive crypto
+    "C": 0.35,         # PLACEHOLDER — COT CME BTC lebih relevan untuk crypto
     "D": 0.40,         # PLACEHOLDER — retail L/S kripto sangat sentimen-driven
+    "F": 0.10,         # PLACEHOLDER — surprise makro AS (lewat USD) imbas tak langsung
     "R_narrative": 0.00,
 }
 """
@@ -456,6 +457,9 @@ def compute_asset_bias(
     retail: dict[str, Any],
     prices: dict[str, Any],
     weights_override: dict[str, float] | None = None,
+    ff_scores: dict[str, dict] | None = None,
+    retail_override: dict[str, dict] | None = None,
+    enabled: set[str] | None = None,
 ) -> dict[str, Any]:
     """Hitung bias per satu aset: driver dict + bias_baseline.
 
@@ -522,20 +526,33 @@ def compute_asset_bias(
 
     freshness = cot_freshness(days_since, price_change_abs, atr14)
 
-    # --- Hitung tiga sub-skor ---
+    # --- Hitung sub-skor ---
     r_hard_score, r_hard_detail = score_R_hard(macro, asset)
     c_score,      c_detail      = score_C(cot, asset, freshness)
-    d_score,      d_detail      = score_D(retail, asset)
+    # D: pakai override retail A1 kalau tersedia, else score_D (sumber lama)
+    if retail_override and asset in retail_override:
+        d_score = float(retail_override[asset].get("score", 0.0))
+        d_detail = retail_override[asset].get("detail", "retail A1 (kontrarian)")
+    else:
+        d_score, d_detail = score_D(retail, asset)
+    # F: ForexFactory surprise (0 kalau kalender FF belum ditarik)
+    if ff_scores and asset in ff_scores:
+        f_score = float(ff_scores[asset].get("score", 0.0))
+        f_detail = ff_scores[asset].get("detail", "FF surprise")
+    else:
+        f_score, f_detail = 0.0, "tak ada FF surprise (tarik kalender FF utk aktifkan)"
 
     scores = {
         "R_hard": r_hard_score,
         "C":      c_score,
         "D":      d_score,
+        "F":      f_score,
     }
     details = {
         "R_hard": r_hard_detail,
         "C":      c_detail,
         "D":      d_detail,
+        "F":      f_detail,
     }
 
     # --- Renormalisasi atas faktor non-zero ---
@@ -547,6 +564,8 @@ def compute_asset_bias(
 
     for factor, score in scores.items():
         weight = w.get(factor, 0.0)
+        if enabled is not None and factor not in enabled:
+            weight = 0.0   # faktor di-OFF-kan user → keluar dari renormalisasi (netral)
         if factor == "C":
             weight = weight * freshness   # bobot efektif COT
         if score != 0.0 and weight > 0.0:
@@ -566,12 +585,14 @@ def compute_asset_bias(
     # --- Bangun driver dict ---
     # Bobot yang "efektif" ditampilkan (nominal; renorm tidak ubah bobot display)
     drivers: dict[str, dict] = {}
-    for factor in ["R_hard", "C", "D"]:
+    for factor in ["R_hard", "C", "D", "F"]:
         nominal_w = w.get(factor, 0.0)
         eff_w = nominal_w * freshness if factor == "C" else nominal_w
+        if enabled is not None and factor not in enabled:
+            eff_w = 0.0
         drivers[factor] = {
             "score":  round(scores[factor], 4),
-            "weight": round(eff_w, 4),          # bobot EFEKTIF (C sudah ×freshness)
+            "weight": round(eff_w, 4),          # bobot EFEKTIF (C ×freshness; OFF→0)
             "weight_nominal": nominal_w,
             "detail": details[factor],
         }
@@ -580,7 +601,7 @@ def compute_asset_bias(
         "drivers":        drivers,
         "bias_baseline":  bias_baseline,
         "active_factors": active,
-        "weights_used":   {k: w.get(k, 0.0) for k in ["R_hard", "C", "D"]},
+        "weights_used":   {k: w.get(k, 0.0) for k in ["R_hard", "C", "D", "F"]},
         "freshness_cot":  round(freshness, 4),
     }
 
@@ -594,6 +615,9 @@ def compute_all_assets(
     cot: dict[str, Any],
     retail: dict[str, Any],
     prices: dict[str, Any],
+    ff_scores: dict[str, dict] | None = None,
+    retail_override: dict[str, dict] | None = None,
+    enabled: set[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Hitung bias untuk semua aset di ASSETS_ALL.
 
@@ -620,6 +644,9 @@ def compute_all_assets(
                 retail=retail,
                 prices=prices,
                 weights_override=w_override,
+                ff_scores=ff_scores,
+                retail_override=retail_override,
+                enabled=enabled,
             )
         except Exception as exc:
             logger.error("compute_asset_bias[%s] gagal: %s", asset, exc, exc_info=True)
@@ -628,6 +655,7 @@ def compute_all_assets(
                     "R_hard": {"score": 0.0, "weight": 0.0, "detail": f"ERROR: {exc}"},
                     "C":      {"score": 0.0, "weight": 0.0, "detail": "ERROR"},
                     "D":      {"score": 0.0, "weight": 0.0, "detail": "ERROR"},
+                    "F":      {"score": 0.0, "weight": 0.0, "detail": "ERROR"},
                 },
                 "bias_baseline":  0.0,
                 "active_factors": [],
