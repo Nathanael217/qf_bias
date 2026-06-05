@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: news toggle→sidebar group + Risk Events tab=ForexFactory (filter ccy/impact + faktor F display, faireconomy baseline in expander) (2026-06-04r)
+# QF_BIAS_BUILD: FF calendar WIB (UTC+7) + kolom Dampak→bias & Freshness (decay) + badge ready/merah (CFTC selalu hijau, retail/calendar merah s.d. ditarik) + myfxbook dihapus + fix duplicate-key (2026-06-04s)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -369,8 +369,9 @@ def _conf_bar(conf: float) -> str:
 # SECTION 1 — HEADER
 # ===========================================================================
 
-def render_header(sources_status: dict[str, Any]) -> None:
+def render_header(sources_status: dict[str, Any], labels: dict[str, str] | None = None) -> None:
     """Render judul, timestamp, status sumber, tombol Refresh."""
+    labels = labels or {}
     ts_utc = now_utc()
     ts_wib = now_wib()
 
@@ -397,12 +398,13 @@ def render_header(sources_status: dict[str, Any]) -> None:
         for src, status in sources_status.items():
             if src.startswith("_"):   # _cot_note dll → bukan badge
                 continue
+            lbl = labels.get(src, src)
             if status == "ok":
-                badge_parts.append(f'<span class="badge-ok">✓ {src}</span>')
+                badge_parts.append(f'<span class="badge-ok">✓ {lbl}</span>')
             elif status == "warn":
-                badge_parts.append(f'<span class="badge-warn">⚠ {src}</span>')
+                badge_parts.append(f'<span class="badge-warn">⚠ {lbl}</span>')
             else:
-                badge_parts.append(f'<span class="badge-fail">✗ {src}</span>')
+                badge_parts.append(f'<span class="badge-fail">✗ {lbl}</span>')
         st.markdown(
             "<div style='display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;'>"
             + " ".join(badge_parts)
@@ -1549,9 +1551,11 @@ def _sentiment_card(rank: int, instrument: str, subtitle: str, tag: str,
 
 
 def _render_ff_calendar(ff: list[dict], ts: str, key_prefix: str = "ff") -> None:
-    """Kalender FF rapi per-hari (Senin–Minggu) + filter currency & impact (seperti Risk Events)."""
+    """Kalender FF (WIB) per-hari + filter ccy/impact + kolom Dampak→bias & Freshness."""
+    from engine.ff_surprise import to_wib, score_event, _now_wib_naive
     released = [e for e in ff if str(e.get("actual", "")).strip()]
-    st.caption(f"Ditarik: {ts} · {len(ff)} event minggu ini · {len(released)} sudah rilis (ada actual)")
+    st.caption(f"Ditarik: {ts} · {len(ff)} event minggu ini · {len(released)} sudah rilis · "
+               "waktu = **WIB** (UTC+7).")
     all_ccy = sorted({(e.get("currency") or "").upper() for e in ff if e.get("currency")})
     fc1, fc2 = st.columns([3, 2])
     with fc1:
@@ -1559,39 +1563,68 @@ def _render_ff_calendar(ff: list[dict], ts: str, key_prefix: str = "ff") -> None
     with fc2:
         sel_imp = st.multiselect("Impact", ["high", "medium", "low"], default=["high", "medium"],
                                  key=f"{key_prefix}_imp")
-    imp_color = {"high": "#ef4444", "medium": "#f59e0b", "low": "#6b7280", "holiday": "#3b82f6"}
+    now_wib = _now_wib_naive()
+    yr = now_wib.year
+
+    # konversi tiap event ke WIB → regroup per tanggal WIB
     days: dict[str, list] = {}
+    order: dict = {}
     for e in ff:
         if (e.get("currency") or "").upper() not in sel_ccy:
             continue
         if (e.get("impact") or "").lower() not in sel_imp:
             continue
-        days.setdefault(e.get("date", "?"), []).append(e)
+        wib = to_wib(e.get("date", ""), e.get("time", ""), yr)
+        if wib is not None:
+            daykey = wib.strftime("%a %d %b")
+            tdisp = wib.strftime("%H:%M")
+            order.setdefault(daykey, wib.replace(hour=0, minute=0))
+        else:
+            daykey = (e.get("date") or "?") + " (sumber)"
+            tdisp = e.get("time", "")
+            order.setdefault(daykey, None)
+        days.setdefault(daykey, []).append((tdisp, e))
     if not days:
         st.info("Tidak ada event sesuai filter.")
         return
-    for day, evs in days.items():
+
+    sorted_days = sorted(days.keys(), key=lambda k: (order.get(k) is None, order.get(k) or now_wib))
+    for day in sorted_days:
         st.markdown(f"**{day}**")
         rows = []
-        for e in evs:
+        for tdisp, e in sorted(days[day], key=lambda te: te[0]):
             act = str(e.get("actual", "")).strip()
             fc = str(e.get("forecast", "")).strip()
             tag = ""
-            try:
-                if act and fc:
+            sc = score_event(e, now_wib)        # poin per-event (None bila belum rilis / tak ada σ)
+            if act and fc:
+                try:
                     a = float(act.replace("%", "").replace("K", "").replace("M", "").replace("B", ""))
                     f = float(fc.replace("%", "").replace("K", "").replace("M", "").replace("B", ""))
                     tag = " 🟢" if a > f else (" 🔴" if a < f else " ⚪")
-            except Exception:
-                tag = ""
+                except Exception:
+                    tag = ""
+            if sc is not None:
+                dampak = f"{sc['ccy']} {sc['points']:+.2f}"
+                ago = sc["days_ago"]
+                ago_txt = "hari ini" if ago < 1 else (f"{int(round(ago))} hr lalu")
+                fresh = f"{sc['freshness']:.2f} ({ago_txt})"
+            elif act:
+                dampak = "— (tanpa σ)"     # rilis tapi tak ada aturan σ → display-only
+                fresh = "—"
+            else:
+                dampak = "—"               # belum rilis
+                fresh = "—"
             rows.append({
-                "Waktu": e.get("time", ""),
+                "Waktu": tdisp,
                 "CCY": e.get("currency", ""),
                 "Impact": e.get("impact", ""),
                 "Event": e.get("name", ""),
                 "Actual": (act + tag) if act else "—",
                 "Forecast": fc or "—",
                 "Previous": str(e.get("previous", "")).strip() or "—",
+                "Dampak→bias": dampak,
+                "Freshness": fresh,
             })
         st.dataframe(rows, use_container_width=True, hide_index=True)
 
@@ -1730,11 +1763,11 @@ def render_risk_events_ff(calendar_data: dict) -> None:
         st.warning("Set `PARSE_API_KEY` di Secrets untuk tarik FF.")
     ff = st.session_state.get("pb_ff_data")
     if ff:
-        _render_ff_calendar(ff, st.session_state.get("pb_ff_ts", "-"), key_prefix="re")
+        _render_ff_calendar(ff, st.session_state.get("pb_ff_ts", "-"), key_prefix="ffre")
         try:
             from engine.ff_surprise import compute_ff_surprise
             from datetime import datetime, timezone, timedelta
-            fs = compute_ff_surprise(ff, datetime.now(timezone(timedelta(hours=7))).date())
+            fs = compute_ff_surprise(ff, datetime.now(timezone(timedelta(hours=7))))
             if fs:
                 st.success("**Faktor F aktif (surprise → bias):** " + " · ".join(
                     f"{c} {v['score']:+.2f}" for c, v in
@@ -2034,8 +2067,8 @@ def main() -> None:
         from engine.ff_surprise import compute_ff_surprise
         from datetime import datetime, timezone, timedelta
         if st.session_state.get("pb_ff_data"):
-            _wib_today = datetime.now(timezone(timedelta(hours=7))).date()
-            ff_scores = compute_ff_surprise(st.session_state["pb_ff_data"], _wib_today)
+            _wib_now = datetime.now(timezone(timedelta(hours=7)))
+            ff_scores = compute_ff_surprise(st.session_state["pb_ff_data"], _wib_now)
     except Exception:
         ff_scores = {}
     _a1ret = (st.session_state.get("a1_retail_data") or {}).get("per_currency", {})
@@ -2117,31 +2150,28 @@ def main() -> None:
         prices_data, macro_data, cot_data,
         retail_data, news_data, calendar_data,
     )
+    # Override status sesuai aturan UX (sumber click-to-run dibaca dari session_state)
+    _has_a1_retail = bool((st.session_state.get("a1_retail_data") or {}).get("per_currency"))
+    _has_a1_cot = bool(st.session_state.get("a1_cot_data"))
+    _has_ff = bool(st.session_state.get("pb_ff_data"))
+    sources_status["cot"] = "ok"                                   # CFTC selalu ada
+    sources_status["retail"] = "ok" if _has_a1_retail else "fail"  # A1 belum ditarik → merah
+    sources_status["news"] = "ok"                                  # selalu ada
+    sources_status["calendar"] = "ok" if _has_ff else "fail"       # FF belum ditarik → merah
+    labels = {
+        "cot": "COT (CFTC + A1)" if _has_a1_cot else "COT (CFTC)",
+        "retail": "retail (A1)" if _has_a1_retail else "retail (tarik A1)",
+        "calendar": "calendar (FF)" if _has_ff else "calendar (tarik FF)",
+        "news": "news",
+    }
 
     with header_placeholder.container():
-        render_header(sources_status)
+        render_header(sources_status, labels)
 
     # -----------------------------------------------------------------------
-    # STEP 5 — Badges sumber gagal (non-fatal)
+    # STEP 5 — (badge merah retail/calendar = "belum ditarik", bukan error;
+    #           sudah tersampaikan via badge. Tidak ada warning myfxbook lagi.)
     # -----------------------------------------------------------------------
-    failed_sources = [s for s, st_val in sources_status.items() if st_val == "fail"]
-    if failed_sources:
-        st.warning(
-            f"⚠️ Sumber gagal: **{', '.join(failed_sources)}** — "
-            "data mungkin tidak lengkap. Engine tetap berjalan dengan data yang ada.",
-            icon="⚠️",
-        )
-        # Detail spesifik myfxbook (retail) supaya tahu stage mana yang gagal
-        _mfx = (retail_data or {}).get("_meta", {}).get("myfxbook_status")
-        if _mfx and not _mfx.startswith("ok"):
-            hint = ""
-            if _mfx.startswith("no_credentials"):
-                hint = " → Secret tak terbaca. Pastikan nama persis `MYFXBOOK_EMAIL` & `MYFXBOOK_PASSWORD`, top-level (tanpa [section]), lalu reboot app."
-            elif _mfx.startswith("login_failed"):
-                hint = " → Login ditolak. Kalau pesannya soal kredensial = email/password salah. Kalau timeout/connection = IP datacenter Streamlit kemungkinan diblokir myfxbook (sama seperti scrape dulu)."
-            elif _mfx.startswith("outlook_failed"):
-                hint = " → Login OK tapi ambil data gagal (mungkin kuota free 100/hari, atau session IP-bound)."
-            st.caption(f"🔎 myfxbook retail: `{_mfx}`{hint}")
 
     # -----------------------------------------------------------------------
     # STEP 6 — Toggle Baseline vs News-Overlaid
