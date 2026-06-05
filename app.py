@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: COT tab CFTC|A1 tersanding per aset (grouped Currency/Komoditas/Crypto/Index) + indikator SEARAH/BEDA + ringkasan; Retail dikelompokkan per kelas; fix badge COT dobel (1 badge, hijau hanya kalau CFTC net ada) (2026-06-04w)
+# QF_BIAS_BUILD: COT arah dibaca dari long%25 (metrik sebanding), fix false-BEDA (AUD/CHF dst) + label-alignment konsisten + expander penjelasan cara-baca/rilis/freshness/dampak (2026-06-04x)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -1814,37 +1814,33 @@ def _cot_canon(k: str) -> str:
     return _COT_CANON_ALIAS.get(u, u)
 
 
-def _cot_dir(slot: dict | None):
-    """Arah net: +1 long, −1 short, 0 netral, None tak ada."""
+def _cot_reading(slot: dict | None):
+    """(label, warna, kategori) — kategori: 'long'/'short'/'neutral'/None.
+    Arah dibaca dari long% (porsi long kotor = metrik yang SEBANDING di CFTC & A1),
+    zona netral ±10. net/net_pct hanya fallback bila long% tak ada."""
     if not slot:
-        return None
-    if slot.get("net") is not None:
-        return 1 if slot["net"] > 0 else (-1 if slot["net"] < 0 else 0)
-    if slot.get("net_pct") is not None:
-        return 1 if slot["net_pct"] > 0 else (-1 if slot["net_pct"] < 0 else 0)
+        return ("— tak ada", "#5b6677", None)
     lp = slot.get("long_pct")
     if lp is not None:
-        return 1 if lp > 50 else (-1 if lp < 50 else 0)
-    return None
+        if abs(lp - 50) < 10:
+            return ("Netral", "#9aa6b6", "neutral")
+        return ("Net-long", "#22c55e", "long") if lp >= 50 else ("Net-short", "#f97316", "short")
+    raw = slot.get("net") if slot.get("net") is not None else slot.get("net_pct")
+    if raw is None:
+        return ("— tak ada", "#5b6677", None)
+    if raw > 0:
+        return ("Net-long", "#22c55e", "long")
+    if raw < 0:
+        return ("Net-short", "#f97316", "short")
+    return ("Netral", "#9aa6b6", "neutral")
 
 
 def _cot_side_html(src: str, slot: dict | None) -> str:
-    if not slot or _cot_dir(slot) is None and slot.get("long_pct") is None:
+    read, rc, _cat = _cot_reading(slot)
+    if not slot or _cat is None:
         return f'<div><div class="qf-side-h">{src}</div><div class="qf-neu">— tak ada</div></div>'
     lp = slot.get("long_pct")
     sp = slot.get("short_pct")
-    if lp is not None:
-        sp = sp if sp is not None else (100 - lp)
-        if abs(lp - 50) < 10:
-            read, rc = "Netral", "#9aa6b6"
-        elif lp >= 50:
-            read, rc = "Net-long", "#22c55e"
-        else:
-            read, rc = "Net-short", "#f97316"
-    else:
-        d = _cot_dir(slot)
-        read, rc = ("Net-long", "#22c55e") if d == 1 else (
-            ("Net-short", "#f97316") if d == -1 else ("Netral", "#9aa6b6"))
     metric = ""
     if slot.get("net") is not None:
         metric = f"net {slot['net']:+,}"
@@ -1854,6 +1850,7 @@ def _cot_side_html(src: str, slot: dict | None) -> str:
         metric = f"net {slot['net_pct']:+.2f}%"
     bar = ""
     if lp is not None:
+        sp = sp if sp is not None else (100 - lp)
         bar = (f'<div class="qf-lsbar"><div style="width:{lp}%;background:#22c55e;"></div>'
                f'<div style="width:{sp}%;background:#f97316;"></div></div>'
                f'<div class="qf-ls">L {lp:.0f}% · S {sp:.0f}%</div>')
@@ -1869,6 +1866,39 @@ def render_cot_tab(cot_data: dict | None = None) -> None:
                "**A1** = CFTC Legacy non-commercial (kategori beda) → **cek arah saja, tidak masuk skor**. "
                "Non-commercial dibaca **searah** (ikut), bukan fade. Mingguan & lagging: snapshot Selasa, "
                "rilis Jumat ~15:30 ET. Generate A1 di bawah untuk menyandingkan.")
+
+    with st.expander("❓ Cara baca COT — CFTC vs A1, rilis, freshness & dampak ke trade"):
+        st.markdown(
+            "**Angka CFTC (kiri):**\n"
+            "- `net` = kontrak **long − short** (Leveraged Funds). Positif = net-long, negatif = net-short. "
+            "Satuannya **kontrak**, bukan persen.\n"
+            "- `idx` = **COT Index 0–100** = posisi `net` sekarang relatif rentang **3 tahun**. "
+            "`>80` = mendekati paling long dalam 3 thn (crowded long), `<20` = crowded short, `~50` = tengah.\n"
+            "- `L%/S%` = porsi long vs short **kotor** (long/(long+short)).\n\n"
+            "**Angka A1 (kanan):**\n"
+            "- `L%/S%` = porsi long/short non-commercial.\n"
+            "- `net%` = metrik net versi A1 — **basis beda**, kadang tak konsisten dengan L%-nya sendiri "
+            "(mis. 66% long tapi net% −4). Karena itu **arah dibaca dari L% (bukan net%)**.\n\n"
+            "**Cara membandingkan:** angka `net` (kontrak) dan `net%` **tidak** disamakan/dipersentasikan — "
+            "skalanya beda. Yang dibandingkan **ARAH** lewat L% vs 50 (zona netral ±10). "
+            "**● SEARAH** = dua kelompok trader sepakat → konviksi naik. **▲ BEDA** = divergensi → hati-hati. "
+            "`—` = salah satu netral/tak ada.\n\n"
+            "**Kapan rilis & apa bedanya:**\n"
+            "- **CFTC**: snapshot **Selasa**, rilis **Jumat ~15:30 ET**. Engine pakai **TFF Leveraged Funds** "
+            "(klasifikasi modern CFTC, proxy hedge fund/CTA) → ini **faktor C**.\n"
+            "- **A1**: diturunkan dari laporan CFTC yang **SAMA**, tapi kategori **Legacy Non-Commercial** "
+            "(klasifikasi lama, lebih luas). Jadi **A1 TIDAK lebih fresh** — sama-sama Selasa/Jumat. "
+            "Bedanya cuma **kategori trader**, bukan waktu.\n\n"
+            "**Freshness & lagging — dampak ke trade-mu:**\n"
+            "- COT itu **lambat**: posisi mingguan, lag ~3 hari saat rilis, dan makin basi sampai Selasa berikutnya. "
+            "**Bukan sinyal entry intraday** — ini konteks **swing/positioning & sizing**.\n"
+            "- `idx` ekstrem (`>80`/`<20`) = posisi **crowded** → risiko reversal/squeeze, tapi **timing jelek** "
+            "(bisa ekstrem berminggu-minggu). Jangan entry hanya karena COT.\n"
+            "- Pakai begini: **CFTC & A1 SEARAH + idx tidak ekstrem** → dukungan untuk bias searah. "
+            "**BEDA** atau **idx ekstrem** → kurangi keyakinan/size, tunggu konfirmasi harga.\n\n"
+            "**Mana yang dipakai?** **CFTC (TFF Leveraged Funds)** sebagai utama (masuk skor). "
+            "**A1 hanya validasi arah** — tidak masuk skor (kategori beda, tak bisa digabung rata-rata)."
+        )
 
     cftc = (cot_data or {}).get("cot", {}) if cot_data else {}
 
@@ -1919,10 +1949,11 @@ def render_cot_tab(cot_data: dict | None = None) -> None:
         for c in members:
             cs = cftc_c.get(c)
             asl = a1_c.get(c)
-            cd, ad = _cot_dir(cs), _cot_dir(asl)
-            if cd is not None and ad is not None and cd != 0 and ad != 0:
+            ccat = _cot_reading(cs)[2]
+            acat = _cot_reading(asl)[2]
+            if ccat in ("long", "short") and acat in ("long", "short"):
                 total += 1
-                same = cd == ad
+                same = ccat == acat
                 agree += 1 if same else 0
                 align = ('<span class="qf-pos qf-align">● SEARAH</span>' if same
                          else '<span class="qf-neg qf-align">▲ BEDA</span>')
