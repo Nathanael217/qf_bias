@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: ENGINE v2 — faktor F (FF surprise z×polarity×impact×freshness) + A1 retail→D + toggle per-faktor + weights rebalanced placeholder (2026-06-04q)
+# QF_BIAS_BUILD: news toggle→sidebar group + Risk Events tab=ForexFactory (filter ccy/impact + faktor F display, faireconomy baseline in expander) (2026-06-04r)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -1548,27 +1548,34 @@ def _sentiment_card(rank: int, instrument: str, subtitle: str, tag: str,
     )
 
 
-def _render_ff_calendar(ff: list[dict], ts: str) -> None:
-    """Kalender FF rapi, dikelompokkan per hari, semua event (Senin–Minggu)."""
+def _render_ff_calendar(ff: list[dict], ts: str, key_prefix: str = "ff") -> None:
+    """Kalender FF rapi per-hari (Senin–Minggu) + filter currency & impact (seperti Risk Events)."""
     released = [e for e in ff if str(e.get("actual", "")).strip()]
     st.caption(f"Ditarik: {ts} · {len(ff)} event minggu ini · {len(released)} sudah rilis (ada actual)")
-    only_major = st.checkbox("Hanya high/medium impact", value=True, key="ff_major_only")
+    all_ccy = sorted({(e.get("currency") or "").upper() for e in ff if e.get("currency")})
+    fc1, fc2 = st.columns([3, 2])
+    with fc1:
+        sel_ccy = st.multiselect("Mata uang", all_ccy, default=all_ccy, key=f"{key_prefix}_ccy")
+    with fc2:
+        sel_imp = st.multiselect("Impact", ["high", "medium", "low"], default=["high", "medium"],
+                                 key=f"{key_prefix}_imp")
     imp_color = {"high": "#ef4444", "medium": "#f59e0b", "low": "#6b7280", "holiday": "#3b82f6"}
-    # urut per hari sesuai urutan kemunculan (FF sudah kronologis)
     days: dict[str, list] = {}
     for e in ff:
-        days.setdefault(e.get("date", "?"), []).append(e)
-    for day, evs in days.items():
-        shown = [e for e in evs if (not only_major or e.get("impact") in ("high", "medium"))]
-        if not shown:
+        if (e.get("currency") or "").upper() not in sel_ccy:
             continue
+        if (e.get("impact") or "").lower() not in sel_imp:
+            continue
+        days.setdefault(e.get("date", "?"), []).append(e)
+    if not days:
+        st.info("Tidak ada event sesuai filter.")
+        return
+    for day, evs in days.items():
         st.markdown(f"**{day}**")
         rows = []
-        for e in shown:
-            ic = imp_color.get(e.get("impact", ""), "#6b7280")
+        for e in evs:
             act = str(e.get("actual", "")).strip()
             fc = str(e.get("forecast", "")).strip()
-            # beat/miss kalau ada actual & forecast numerik
             tag = ""
             try:
                 if act and fc:
@@ -1702,6 +1709,43 @@ def render_cot_tab(cot_data: dict | None = None) -> None:
                                if pct >= 80 else "→ ada divergensi, cek event/kategori.")
                     st.caption(f"🔁 Arah searah: {agree}/{total} ({pct}%) {verdict}")
                     st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def render_risk_events_ff(calendar_data: dict) -> None:
+    """Risk Events berbasis ForexFactory (acuan + actual) + faktor F; baseline faireconomy di expander."""
+    pb = _get_pb()
+    has_key = pb is not None and pb._api_key() is not None
+    st.subheader("⏰ Risk Events — ForexFactory")
+    st.caption("Acuan event + **actual** dari ForexFactory (via parse.bot). Surprise rilis → faktor **F** "
+               "di Currency Power (z×polaritas×impact×freshness). Tarik = 1 call (cache 6 jam).")
+    if st.button("🔄 Tarik / refresh kalender FF (minggu ini)", key="re_ff_fetch", disabled=not has_key):
+        try:
+            with st.spinner("…"):
+                st.session_state["pb_ff_data"] = pb.parse_ff_calendar(
+                    pb.fetch(pb.SCRAPERS["forexfactory"], "get_calendar", {}, ttl=21_600))
+                st.session_state["pb_ff_ts"] = _now_wib_str()
+        except Exception as exc:
+            st.error(f"FF: {exc}")
+    if not has_key:
+        st.warning("Set `PARSE_API_KEY` di Secrets untuk tarik FF.")
+    ff = st.session_state.get("pb_ff_data")
+    if ff:
+        _render_ff_calendar(ff, st.session_state.get("pb_ff_ts", "-"), key_prefix="re")
+        try:
+            from engine.ff_surprise import compute_ff_surprise
+            from datetime import datetime, timezone, timedelta
+            fs = compute_ff_surprise(ff, datetime.now(timezone(timedelta(hours=7))).date())
+            if fs:
+                st.success("**Faktor F aktif (surprise → bias):** " + " · ".join(
+                    f"{c} {v['score']:+.2f}" for c, v in
+                    sorted(fs.items(), key=lambda kv: -abs(kv[1]["score"]))))
+        except Exception:
+            pass
+    else:
+        st.info("Belum tarik FF minggu ini. Klik tombol di atas untuk lihat actual + aktifkan faktor F. "
+                "Baseline gratis (faireconomy) tetap ada di bawah.")
+    with st.expander("📋 Baseline gratis (faireconomy) + input actual manual"):
+        render_key_risk_events(calendar_data)
 
 
 def render_data_feeds() -> None:
@@ -1977,6 +2021,10 @@ def main() -> None:
         en_cot = st.checkbox("COT — CFTC smart money (C)", value=True, key="en_cot")
         en_ret = st.checkbox("Retail sentiment — A1 kontrarian (D)", value=True, key="en_ret")
         en_ff = st.checkbox("FF surprise — actual vs forecast (F)", value=True, key="en_ff")
+        st.caption("News overlay = delta aditif di atas baseline (beda dari 4 faktor di atas).")
+        show_overlay = st.checkbox(
+            "★ News overlay ke bias (±30)", value=False, key="en_news",
+            help="bias_score = baseline + news_delta (cap ±30). Off = baseline murni.")
     enabled = {f for f, on in [("R_hard", en_rate), ("C", en_cot), ("D", en_ret), ("F", en_ff)] if on}
 
     # Bangun FF surprise + A1 retail override dari data click-to-run (kalau sudah ditarik)
@@ -2098,16 +2146,6 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # STEP 6 — Toggle Baseline vs News-Overlaid
     # -----------------------------------------------------------------------
-    toggle_col, _ = st.columns([2, 5])
-    with toggle_col:
-        show_overlay = st.toggle(
-            "★ News Overlay aktif",
-            value=False,
-            help="Tampilkan bias_score = baseline + news_delta (cap ±30). "
-                 "Nonaktif = baseline murni dari R_hard / COT / Retail.",
-        )
-
-    # -----------------------------------------------------------------------
     # STEP 7 — Tabs display
     # -----------------------------------------------------------------------
     tab_board, tab_pairs, tab_detail, tab_news, tab_events, tab_retail, tab_cot, tab_feeds = st.tabs([
@@ -2147,7 +2185,7 @@ def main() -> None:
 
     with tab_events:
         try:
-            render_key_risk_events(calendar_data)
+            render_risk_events_ff(calendar_data)
         except Exception as exc:
             st.error(f"Key Risk Events error: {exc}")
 
