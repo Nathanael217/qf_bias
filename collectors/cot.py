@@ -95,6 +95,9 @@ _COL_DATE = "Report_Date_as_YYYY-MM-DD"   # TFF modern; fallback ke MM_DD_YYYY d
 _CAT_COLS: dict[str, tuple[str, str]] = {
     "leveraged_funds": ("Lev_Money_Positions_Long_All", "Lev_Money_Positions_Short_All"),
     "managed_money":   ("Asset_Mgr_Positions_Long_All", "Asset_Mgr_Positions_Short_All"),
+    # DUMB MONEY: Non-Reportable = small traders di bawah ambang pelaporan (retail-ish).
+    # Kolom ada di file TFF yang SAMA (sudah di-download). Proxy dumb-money gratis, no-auth.
+    "nonreportable":   ("NonRept_Positions_Long_All", "NonRept_Positions_Short_All"),
 }
 
 
@@ -397,6 +400,18 @@ def get_cot() -> dict[str, Any]:
             continue
 
         slot["net"] = net
+        # long%/short% dari komponen long & short (untuk kartu UI, samakan dgn A1)
+        _cols = _CAT_COLS.get(category)
+        if _cols:
+            try:
+                _l = float(latest.get(_cols[0], 0))
+                _s = float(latest.get(_cols[1], 0))
+                _tot = _l + _s
+                if _tot > 0:
+                    slot["long_pct"] = round(_l / _tot * 100, 1)
+                    slot["short_pct"] = round(_s / _tot * 100, 1)
+            except (TypeError, ValueError):
+                pass
         # COT Index = percentile vs window 156 mgg (Python murni)
         nets = [n for n in (_net_from_rec(r, category) for r in asset_rows) if n is not None]
         if len(nets) >= _MIN_WEEKS_FOR_INDEX:
@@ -407,6 +422,21 @@ def get_cot() -> dict[str, Any]:
             else:
                 idx = (net - lo) / (hi - lo) * 100.0
                 slot["cot_index"] = round(max(0.0, min(100.0, idx)), 1)
+
+        # --- DUMB MONEY (Non-Reportable / small traders) — DISPLAY-ONLY ---
+        # Tidak di-wire ke poin bias (itu keputusan backtest). Diekspos sebagai konteks +
+        # divergence vs smart money. Net positif = retail net-long aset itu.
+        dumb_net = _net_from_rec(latest, "nonreportable")
+        if dumb_net is not None:
+            slot["dumb_net"] = dumb_net
+            dnets = [n for n in (_net_from_rec(r, "nonreportable") for r in asset_rows) if n is not None]
+            if len(dnets) >= _MIN_WEEKS_FOR_INDEX:
+                dwin = dnets[-_FULL_WINDOW_WEEKS:] if len(dnets) > _FULL_WINDOW_WEEKS else dnets
+                dlo, dhi = min(dwin), max(dwin)
+                slot["dumb_index"] = 50.0 if dhi == dlo else round(max(0.0, min(100.0, (dumb_net - dlo) / (dhi - dlo) * 100.0)), 1)
+            # Divergence: smart (net) vs dumb (dumb_net) tanda berlawanan = setup kontrarian klasik
+            if net is not None and dumb_net != 0 and (net > 0) != (dumb_net > 0):
+                slot["smart_dumb_divergence"] = True
 
         result["cot"][asset] = slot
         result["_meta"]["assets_ok"].append(asset)
