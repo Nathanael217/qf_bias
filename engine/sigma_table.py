@@ -147,6 +147,14 @@ def _match_rule(name_norm: str, currency: str | None) -> dict[str, Any] | None:
     return None
 
 
+def sigma_polarity(name: str, currency: str | None = None) -> tuple[float | None, int | None]:
+    """Lookup σ + polarity untuk nama event. (None, None) kalau tak ada rule."""
+    rule = _match_rule(_norm(name), currency)
+    if rule is None:
+        return None, None
+    return rule.get("sigma"), rule.get("polarity")
+
+
 def enrich_surprise_fields(events: list[dict[str, Any]]) -> dict[str, int]:
     """
     Set historical_std + surprise_polarity (+ sigma_basis) pada event yang
