@@ -75,9 +75,10 @@ def pair_components(symbol: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 WEIGHTS: dict[str, float] = {
-    "R_hard": 0.60,       # PLACEHOLDER — rate surprise + rate differential; bukti kausal tertinggi
-    "C": 0.25,            # PLACEHOLDER — COT (efektif lebih kecil krn gating ekstrem-only)
-    "D": 0.15,            # PLACEHOLDER — Retail sentiment contrarian (efektif lebih kecil krn gating)
+    "R_hard": 0.45,       # PLACEHOLDER — rate differential + rate surprise
+    "C": 0.20,            # PLACEHOLDER — COT (efektif lebih kecil krn gating ekstrem-only)
+    "D": 0.15,            # PLACEHOLDER — Retail sentiment contrarian (gating ekstrem)
+    "F": 0.20,            # PLACEHOLDER — ForexFactory surprise (actual vs forecast × impact × freshness)
     "R_narrative": 0.00,  # Advisory; tidak masuk skor v1
 }
 """
