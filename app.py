@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: FF calendar WIB (UTC+7) + kolom Dampak→bias & Freshness (decay) + badge ready/merah (CFTC selalu hijau, retail/calendar merah s.d. ditarik) + myfxbook dihapus + fix duplicate-key (2026-06-04s)
+# QF_BIAS_BUILD: Bias Board redesign (grid 3-kolom, kartu metavulus gelap, driver selalu terbaca) + Pair Scanner sort skor tertinggi + baris metavulus + Risk Events kolom Freshness sebelum Dampak (2026-06-04t)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -124,8 +124,40 @@ st.markdown("""
 
 /* Footer */
 .footer-note { color:#6b7280; font-size:0.78rem; padding:12px; border-top:1px solid #e5e7eb; margin-top:24px; }
-</style>
-""", unsafe_allow_html=True)
+
+/* ===== Metavulus-style dark cards ===== */
+.qf-card { background:#0f141b; border:1px solid #1e2530; border-radius:14px; padding:16px 16px 14px;
+           margin-bottom:14px; }
+.qf-card.sel { border-color:#3b4658; box-shadow:0 0 0 1px #3b4658; }
+.qf-head { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
+.qf-micro { color:#64748b; font-size:0.60rem; letter-spacing:0.09em; text-transform:uppercase; font-weight:700; }
+.qf-asset { color:#e2e8f0; font-size:1.18rem; font-weight:800; line-height:1.15; }
+.qf-chip { padding:3px 11px; border-radius:999px; font-weight:800; font-size:0.92rem; white-space:nowrap; }
+.qf-chip-pos { background:#0e2a1a; color:#4ade80; }
+.qf-chip-neg { background:#2c1417; color:#f87171; }
+.qf-chip-neu { background:#1c232e; color:#9aa6b6; }
+.qf-label { font-weight:700; font-size:0.92rem; margin-top:7px; }
+.qf-bar { position:relative; height:8px; border-radius:6px; margin:9px 0 4px;
+          background:linear-gradient(90deg,#dc2626 0%,#f59e0b 50%,#16a34a 100%); }
+.qf-bar-mk { position:absolute; top:-3px; width:3px; height:14px; background:#fff; border-radius:2px;
+             transform:translateX(-50%); box-shadow:0 0 4px rgba(0,0,0,.6); }
+.qf-meta { color:#64748b; font-size:0.72rem; margin-top:3px; display:flex; justify-content:space-between; }
+.qf-drv { border-top:1px solid #1b212b; padding-top:8px; margin-top:10px; }
+.qf-drv-row { display:flex; justify-content:space-between; align-items:baseline; gap:8px; margin-top:7px; }
+.qf-drv-name { font-weight:700; color:#cbd5e1; font-size:0.80rem; }
+.qf-drv-w { color:#5b6677; font-size:0.70rem; font-weight:500; }
+.qf-drv-val { font-weight:800; font-size:0.80rem; }
+.qf-drv-detail { color:#8b97a7; font-size:0.735rem; line-height:1.4; margin-top:2px; }
+.qf-pos { color:#4ade80; } .qf-neg { color:#f87171; } .qf-neu { color:#94a3b8; }
+/* Pair scanner rows */
+.qf-prow { display:grid; grid-template-columns:96px 72px 96px 56px 1fr; gap:12px; align-items:center;
+           padding:11px 14px; border-bottom:1px solid #161c25; }
+.qf-prow.head { color:#64748b; font-size:0.66rem; letter-spacing:.06em; text-transform:uppercase;
+                font-weight:700; border-bottom:1px solid #243041; }
+.qf-pair { font-weight:800; color:#e2e8f0; font-size:0.95rem; }
+.qf-pnote { color:#8b97a7; font-size:0.76rem; }
+.qf-wrap { background:#0b0f15; border:1px solid #1e2530; border-radius:14px; overflow:hidden; }
+</style>""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Guard — jika import gagal
@@ -422,6 +454,62 @@ def render_header(sources_status: dict[str, Any], labels: dict[str, str] | None 
 # SECTION 4a — BIAS BOARD
 # ===========================================================================
 
+_FACTOR_NAMES = {"R_hard": "Rate diff", "C": "COT", "D": "Retail", "F": "FF surprise",
+                 "R_narrative": "News"}
+
+
+def _chip(score: float, scale100: bool = True) -> str:
+    """Pill skor berwarna. score dalam −100..100 (scale100) atau −1..1."""
+    v = score if scale100 else score * 100
+    cls = "qf-chip-pos" if v >= 8 else ("qf-chip-neg" if v <= -8 else "qf-chip-neu")
+    sign = "+" if v >= 0 else ""
+    txt = f"{sign}{v:.0f}" if scale100 else f"{score:+.3f}"
+    return f'<span class="qf-chip {cls}">{txt}</span>'
+
+
+def _pressure(score100: float) -> str:
+    pos = max(0.0, min(100.0, (score100 + 100.0) / 2.0))
+    return f'<div class="qf-bar"><div class="qf-bar-mk" style="left:{pos:.1f}%;"></div></div>'
+
+
+def _vcls(v: float) -> str:
+    return "qf-pos" if v > 0.0005 else ("qf-neg" if v < -0.0005 else "qf-neu")
+
+
+def _asset_card_html(asset: str, group: str, score: float, label: str, conf: float,
+                     drivers: dict, delta: float = 0.0, show_overlay: bool = False) -> str:
+    """Kartu aset metavulus (self-contained) — driver selalu tampil & terbaca."""
+    chip = _chip(score)
+    lab_cls = _vcls(score / 100.0)
+    meta_l = f"confidence {conf*100:.0f}%" if conf else "confidence —"
+    meta_r = ""
+    if show_overlay and abs(delta) > 0.1:
+        dd = f"+{delta:.1f}" if delta >= 0 else f"{delta:.1f}"
+        meta_r = f'<span class="{_vcls(delta)}">Δnews {dd}</span>'
+    drv_html = ""
+    for f, fd in (drivers or {}).items():
+        fs = fd.get("score", 0.0)
+        fw = fd.get("weight", 0.0)
+        det = (fd.get("detail") or "–").strip()
+        nm = _FACTOR_NAMES.get(f, f)
+        drv_html += (
+            f'<div class="qf-drv-row"><span class="qf-drv-name">{nm} '
+            f'<span class="qf-drv-w">w{fw:.2f}</span></span>'
+            f'<span class="qf-drv-val {_vcls(fs)}">{fs:+.3f}</span></div>'
+            f'<div class="qf-drv-detail">{det}</div>'
+        )
+    drv_block = f'<div class="qf-drv">{drv_html}</div>' if drv_html else ""
+    return (
+        f'<div class="qf-card">'
+        f'<div class="qf-head"><div><div class="qf-micro">{group}</div>'
+        f'<div class="qf-asset">{asset}</div></div>{chip}</div>'
+        f'<div class="qf-label {lab_cls}">{label}</div>'
+        f'{_pressure(score)}'
+        f'<div class="qf-meta"><span>{meta_l}</span>{meta_r}</div>'
+        f'{drv_block}</div>'
+    )
+
+
 def render_bias_board(
     asset_data: dict[str, dict],
     news_delta: dict[str, float],
@@ -430,97 +518,44 @@ def render_bias_board(
     """Render grid kartu per aset dengan bar skor, label, confidence, driver breakdown."""
 
     st.subheader("📈 Bias Board")
+    st.caption("Mulai dari asetnya, lalu susun rencana. Skor = confluence faktor (bukan sinyal arah). "
+               "Driver tampil penuh di tiap kartu.")
 
     if not asset_data:
         st.warning("Data bias aset kosong — periksa collectors.")
         return
 
-    # Kelompokkan: FX, XAU, Crypto
     groups = [
-        ("FX Majors", ASSETS_FX),
-        ("Commodities", [ASSET_GOLD]),
-        ("Crypto", ASSETS_CRYPTO),
+        ("FX Majors", "FX", ASSETS_FX),
+        ("Commodities", "METAL", [ASSET_GOLD]),
+        ("Crypto", "CRYPTO", ASSETS_CRYPTO),
     ]
 
-    for group_name, group_assets in groups:
-        st.markdown(f"**{group_name}**")
-        cols = st.columns(len(group_assets))
-
-        for col, asset in zip(cols, group_assets):
-            data = asset_data.get(asset)
-            if data is None:
-                col.warning(f"{asset}: no data")
-                continue
-
-            baseline = data.get("bias_baseline", 0.0)
-            delta = news_delta.get(asset, 0.0)
-
-            if show_overlay:
-                score = max(-100.0, min(100.0, baseline + delta))
-                label_suffix = " ★"  # indikasi overlay aktif
-            else:
-                score = baseline
-                label_suffix = ""
-
-            label = bias_label(score)
-            conf = data.get("confidence", 0.0) or 0.0
-            drivers = data.get("drivers", {})
-
-            with col:
-                with st.container():
-                    # Header kartu
+    for group_name, micro, group_assets in groups:
+        st.markdown(f"#### {group_name}")
+        # tata ulang jadi baris berisi 3 kartu (lebar → driver terbaca)
+        for i in range(0, len(group_assets), 3):
+            chunk = group_assets[i:i + 3]
+            cols = st.columns(3)
+            for col, asset in zip(cols, chunk):
+                data = asset_data.get(asset)
+                if data is None:
+                    col.warning(f"{asset}: no data")
+                    continue
+                baseline = data.get("bias_baseline", 0.0)
+                delta = news_delta.get(asset, 0.0)
+                if show_overlay:
+                    score = max(-100.0, min(100.0, baseline + delta))
+                else:
+                    score = baseline
+                label = bias_label(score)
+                conf = data.get("confidence", 0.0) or 0.0
+                drivers = data.get("drivers", {})
+                with col:
                     st.markdown(
-                        f"<div style='font-weight:700;font-size:1.05rem;'>{asset}</div>",
+                        _asset_card_html(asset, micro, score, label, conf, drivers, delta, show_overlay),
                         unsafe_allow_html=True,
                     )
-
-                    # Skor
-                    sign = "+" if score >= 0 else ""
-                    st.markdown(
-                        f"<div style='font-size:1.4rem;font-weight:700;"
-                        f"color:{_bias_color(score)};'>{sign}{score:.1f}</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                    # Bar
-                    st.markdown(_bias_bar_html(score, width_px=140), unsafe_allow_html=True)
-
-                    # Label + confidence
-                    st.markdown(
-                        f"{_label_html(label + label_suffix)} &nbsp; {_conf_bar(conf)}",
-                        unsafe_allow_html=True,
-                    )
-
-                    # News delta (kalau aktif & ada)
-                    if show_overlay and abs(delta) > 0.1:
-                        delta_str = f"+{delta:.1f}" if delta >= 0 else f"{delta:.1f}"
-                        col_nd = "#16a34a" if delta >= 0 else "#dc2626"
-                        st.markdown(
-                            f"<div style='font-size:0.72rem;color:{col_nd};'>Δnews: {delta_str}</div>",
-                            unsafe_allow_html=True,
-                        )
-
-                    # Driver breakdown (expander)
-                    if drivers:
-                        with st.expander("📋 Drivers", expanded=False):
-                            for factor, fdata in drivers.items():
-                                fscore = fdata.get("score", 0.0)
-                                fweight = fdata.get("weight", 0.0)
-                                fdetail = fdata.get("detail", "–")
-                                fcol = _bias_color(fscore * 100)
-                                st.markdown(
-                                    f"<div style='font-size:0.78rem;margin-bottom:4px;'>"
-                                    f"<span style='font-weight:600;'>{factor}</span> "
-                                    f"<span style='color:{fcol};font-weight:700;'>{fscore:+.3f}</span> "
-                                    f"<span style='color:#6b7280;'>(w={fweight:.2f})</span><br>"
-                                    f"<span style='color:#374151;'>{fdetail}</span>"
-                                    f"</div>",
-                                    unsafe_allow_html=True,
-                                )
-                    else:
-                        st.caption("–")
-
-        st.markdown("<br>", unsafe_allow_html=True)
 
 
 # ===========================================================================
@@ -621,10 +656,9 @@ def render_pair_scanner(
                 else:
                     st.info(f"Pair {pair_sym} tidak ada di data terkomputasi.")
 
-    # --- Ranking tabel pair terkuat ---
-    st.markdown("**📊 Ranking Pair (sort |bias|)**")
+    # --- Ranking semua pair (sort skor tertinggi → terendah) ---
+    st.markdown("#### Ranking Pair — skor tertinggi dulu")
     try:
-        # Kalau overlay, rebuild pair dengan overlay score
         if show_overlay:
             overlay_asset_map: dict[str, dict] = {}
             for asset, adata in asset_data.items():
@@ -636,23 +670,26 @@ def render_pair_scanner(
             ranking_pairs = pair_data
 
         ranked = rank_pairs(ranking_pairs, top_n=len(PAIRS))
+        # sort skor signed (paling tinggi/bullish dulu)
+        ranked = sorted(ranked, key=lambda r: r.get("bias_score", 0.0), reverse=True)
 
         if ranked:
-            tbl_data = []
+            rows = ('<div class="qf-prow head"><span>Pair</span><span>Skor</span>'
+                    '<span>Label</span><span>Conf</span><span>Kalkulasi</span></div>')
             for r in ranked:
-                score_r = r.get("bias_score", 0.0)
+                sc = r.get("bias_score", 0.0)
                 conf_r = r.get("confidence")
                 conf_str = f"{conf_r*100:.0f}%" if conf_r is not None else "–"
-                tbl_data.append({
-                    "Pair": r["pair"],
-                    "Score": f"{'+' if score_r>=0 else ''}{score_r:.1f}",
-                    "Label": r.get("label", bias_label(score_r)),
-                    "Conf": conf_str,
-                    "Kalkulasi": r.get("note", ""),
-                })
-            import pandas as pd
-            df = pd.DataFrame(tbl_data)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+                note = (r.get("note") or "").strip() or "–"
+                rows += (
+                    f'<div class="qf-prow"><span class="qf-pair">{r["pair"]}</span>'
+                    f'{_chip(sc)}'
+                    f'<span class="qf-label {_vcls(sc/100.0)}" style="font-size:0.82rem;">'
+                    f'{r.get("label", bias_label(sc))}</span>'
+                    f'<span class="qf-pnote">{conf_str}</span>'
+                    f'<span class="qf-pnote">{note}</span></div>'
+                )
+            st.markdown(f'<div class="qf-wrap">{rows}</div>', unsafe_allow_html=True)
         else:
             st.info("Tidak ada pair yang bisa di-rank.")
     except Exception as exc:
@@ -1623,8 +1660,8 @@ def _render_ff_calendar(ff: list[dict], ts: str, key_prefix: str = "ff") -> None
                 "Actual": (act + tag) if act else "—",
                 "Forecast": fc or "—",
                 "Previous": str(e.get("previous", "")).strip() or "—",
-                "Dampak→bias": dampak,
                 "Freshness": fresh,
+                "Dampak→bias": dampak,
             })
         st.dataframe(rows, use_container_width=True, hide_index=True)
 
