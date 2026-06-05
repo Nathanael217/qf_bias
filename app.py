@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: Bias Board redesign (grid 3-kolom, kartu metavulus gelap, driver selalu terbaca) + Pair Scanner sort skor tertinggi + baris metavulus + Risk Events kolom Freshness sebelum Dampak (2026-06-04t)
+# QF_BIAS_BUILD: COT tab — kartu A1 (format sama _sentiment_card) setelah generate + tabel confidence A1-vs-CFTC metavulus dgn kolom Kesimpulan (SEARAH naik/BEDA turun, display-only) + Risk Events kalender restyle baris metavulus (2026-06-04v)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -157,6 +157,22 @@ st.markdown("""
 .qf-pair { font-weight:800; color:#e2e8f0; font-size:0.95rem; }
 .qf-pnote { color:#8b97a7; font-size:0.76rem; }
 .qf-wrap { background:#0b0f15; border:1px solid #1e2530; border-radius:14px; overflow:hidden; }
+/* COT confidence table */
+.qf-cotrow { display:grid; grid-template-columns:64px 104px 88px 92px 1fr; gap:12px; align-items:center;
+             padding:11px 14px; border-bottom:1px solid #161c25; }
+.qf-cotrow.head { color:#64748b; font-size:0.66rem; letter-spacing:.06em; text-transform:uppercase;
+                  font-weight:700; border-bottom:1px solid #243041; }
+/* Risk Events calendar rows */
+.qf-calday { color:#9aa6b6; font-weight:800; font-size:0.92rem; margin:14px 0 4px;
+             padding-bottom:6px; border-bottom:1px solid #1e2530; }
+.qf-cal { display:grid; grid-template-columns:62px 52px 64px 1fr 132px 118px 92px; gap:10px;
+          align-items:center; padding:10px 14px; border-bottom:1px solid #141a22; font-size:0.78rem; }
+.qf-cal.head { color:#64748b; font-size:0.64rem; letter-spacing:.05em; text-transform:uppercase;
+               font-weight:700; border-bottom:1px solid #243041; }
+.qf-cal .ev { color:#dbe2ea; font-weight:600; }
+.qf-cal .afp { color:#8b97a7; font-size:0.74rem; }
+.qf-imp-h { color:#f87171; font-weight:700; } .qf-imp-m { color:#f59e0b; font-weight:700; }
+.qf-imp-l { color:#6b7280; font-weight:600; }
 </style>""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
@@ -491,12 +507,17 @@ def _asset_card_html(asset: str, group: str, score: float, label: str, conf: flo
         fs = fd.get("score", 0.0)
         fw = fd.get("weight", 0.0)
         det = (fd.get("detail") or "–").strip()
+        # pecah tiap ';' dan '|' ke baris baru biar tidak bertabrakan
+        for sep in ("|", ";"):
+            det = det.replace(sep, "\n")
+        det_lines = [p.strip() for p in det.split("\n") if p.strip()]
+        det_html = "<br>".join(det_lines) if det_lines else "–"
         nm = _FACTOR_NAMES.get(f, f)
         drv_html += (
             f'<div class="qf-drv-row"><span class="qf-drv-name">{nm} '
             f'<span class="qf-drv-w">w{fw:.2f}</span></span>'
             f'<span class="qf-drv-val {_vcls(fs)}">{fs:+.3f}</span></div>'
-            f'<div class="qf-drv-detail">{det}</div>'
+            f'<div class="qf-drv-detail">{det_html}</div>'
         )
     drv_block = f'<div class="qf-drv">{drv_html}</div>' if drv_html else ""
     return (
@@ -561,6 +582,39 @@ def render_bias_board(
 # ===========================================================================
 # SECTION 4b — PAIR SCANNER
 # ===========================================================================
+
+_FX_PREC = ["EUR", "GBP", "AUD", "NZD", "USD", "CAD", "CHF", "JPY"]
+
+
+def _all_pairs_from_assets(asset_data: dict, overlay_map: dict | None = None) -> list[dict]:
+    """Semua pair berdasar konvensi quoting FX (base=presedensi lebih tinggi) +
+    XAU/BTC/ETH vs USD. Skor = base_bias − quote_bias (clamp ±100)."""
+    src = overlay_map or asset_data
+
+    def bias(a: str) -> float:
+        return src.get(a, {}).get("bias_baseline", 0.0)
+
+    def conf2(a: str, b: str):
+        cs = [c for c in (asset_data.get(a, {}).get("confidence"),
+                          asset_data.get(b, {}).get("confidence")) if c is not None]
+        return sum(cs) / len(cs) if cs else None
+
+    def mk(a: str, b: str) -> dict:
+        sc = max(-100.0, min(100.0, bias(a) - bias(b)))
+        return {"pair": f"{a}{b}", "bias_score": sc, "confidence": conf2(a, b),
+                "label": bias_label(sc),
+                "note": f"{a}·{bias(a):.2f} − {b}·{bias(b):.2f} = {sc:.2f}"}
+
+    out: list[dict] = []
+    fx = [c for c in _FX_PREC if c in asset_data]
+    for i, a in enumerate(fx):
+        for b in fx[i + 1:]:
+            out.append(mk(a, b))                       # a presedensi > b → base=a
+    for m in [ASSET_GOLD] + list(ASSETS_CRYPTO):
+        if m in asset_data and "USD" in asset_data:
+            out.append(mk(m, "USD"))
+    return out
+
 
 def render_pair_scanner(
     pair_data: dict[str, dict],
@@ -659,18 +713,15 @@ def render_pair_scanner(
     # --- Ranking semua pair (sort skor tertinggi → terendah) ---
     st.markdown("#### Ranking Pair — skor tertinggi dulu")
     try:
+        overlay_map = None
         if show_overlay:
-            overlay_asset_map: dict[str, dict] = {}
+            overlay_map = {}
             for asset, adata in asset_data.items():
                 baseline = adata.get("bias_baseline", 0.0)
-                overlaid = max(-100.0, min(100.0, baseline + news_delta.get(asset, 0.0)))
-                overlay_asset_map[asset] = {**adata, "bias_baseline": overlaid}
-            ranking_pairs = compute_pairs(overlay_asset_map)
-        else:
-            ranking_pairs = pair_data
-
-        ranked = rank_pairs(ranking_pairs, top_n=len(PAIRS))
-        # sort skor signed (paling tinggi/bullish dulu)
+                overlay_map[asset] = {**adata,
+                                      "bias_baseline": max(-100.0, min(100.0,
+                                                       baseline + news_delta.get(asset, 0.0)))}
+        ranked = _all_pairs_from_assets(asset_data, overlay_map)
         ranked = sorted(ranked, key=lambda r: r.get("bias_score", 0.0), reverse=True)
 
         if ranked:
@@ -690,6 +741,7 @@ def render_pair_scanner(
                     f'<span class="qf-pnote">{note}</span></div>'
                 )
             st.markdown(f'<div class="qf-wrap">{rows}</div>', unsafe_allow_html=True)
+            st.caption(f"{len(ranked)} pair (semua kombinasi FX + XAU/BTC/ETH vs USD).")
         else:
             st.info("Tidak ada pair yang bisa di-rank.")
     except Exception as exc:
@@ -1626,12 +1678,17 @@ def _render_ff_calendar(ff: list[dict], ts: str, key_prefix: str = "ff") -> None
         return
 
     sorted_days = sorted(days.keys(), key=lambda k: (order.get(k) is None, order.get(k) or now_wib))
+    _impc = {"high": "qf-imp-h", "medium": "qf-imp-m", "low": "qf-imp-l"}
     for day in sorted_days:
-        st.markdown(f"**{day}**")
-        rows = []
+        st.markdown(f'<div class="qf-calday">{day} <span style="color:#5b6677;font-weight:500;'
+                    f'font-size:0.72rem;">WIB</span></div>', unsafe_allow_html=True)
+        body = ('<div class="qf-cal head"><span>Waktu</span><span>CCY</span><span>Impact</span>'
+                '<span>Event</span><span>Act / Fc / Prev</span><span>Freshness</span>'
+                '<span>Dampak→bias</span></div>')
         for tdisp, e in sorted(days[day], key=lambda te: te[0]):
             act = str(e.get("actual", "")).strip()
             fc = str(e.get("forecast", "")).strip()
+            prev = str(e.get("previous", "")).strip()
             tag = ""
             sc = score_event(e, now_wib)        # poin per-event (None bila belum rilis / tak ada σ)
             if act and fc:
@@ -1642,28 +1699,29 @@ def _render_ff_calendar(ff: list[dict], ts: str, key_prefix: str = "ff") -> None
                 except Exception:
                     tag = ""
             if sc is not None:
-                dampak = f"{sc['ccy']} {sc['points']:+.2f}"
+                dcls = _vcls(sc["points"])
+                dampak = f'<span class="{dcls}">{sc["ccy"]} {sc["points"]:+.2f}</span>'
                 ago = sc["days_ago"]
-                ago_txt = "hari ini" if ago < 1 else (f"{int(round(ago))} hr lalu")
-                fresh = f"{sc['freshness']:.2f} ({ago_txt})"
+                ago_txt = "hari ini" if ago < 1 else f"{int(round(ago))} hr lalu"
+                fresh = f'{sc["freshness"]:.2f} <span style="color:#5b6677;">({ago_txt})</span>'
             elif act:
-                dampak = "— (tanpa σ)"     # rilis tapi tak ada aturan σ → display-only
+                dampak = '<span class="qf-neu">— (tanpa σ)</span>'
                 fresh = "—"
             else:
-                dampak = "—"               # belum rilis
+                dampak = '<span class="qf-neu">—</span>'
                 fresh = "—"
-            rows.append({
-                "Waktu": tdisp,
-                "CCY": e.get("currency", ""),
-                "Impact": e.get("impact", ""),
-                "Event": e.get("name", ""),
-                "Actual": (act + tag) if act else "—",
-                "Forecast": fc or "—",
-                "Previous": str(e.get("previous", "")).strip() or "—",
-                "Freshness": fresh,
-                "Dampak→bias": dampak,
-            })
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+            impc = _impc.get((e.get("impact") or "").lower(), "qf-imp-l")
+            afp = f'{(act + tag) if act else "—"} / {fc or "—"} / {prev or "—"}'
+            body += (
+                f'<div class="qf-cal"><span>{tdisp}</span>'
+                f'<span class="qf-pair" style="font-size:0.82rem;">{e.get("currency","")}</span>'
+                f'<span class="{impc}">{(e.get("impact") or "").upper()}</span>'
+                f'<span class="ev">{e.get("name","")}</span>'
+                f'<span class="afp">{afp}</span>'
+                f'<span>{fresh}</span><span>{dampak}</span></div>'
+            )
+        st.markdown(f'<div class="qf-wrap">{body}</div>', unsafe_allow_html=True)
+    return
 
 
 def render_retail_tab() -> None:
@@ -1739,46 +1797,86 @@ def render_cot_tab(cot_data: dict | None = None) -> None:
             st.markdown(_sentiment_card(i, disp, sub, tag, lp, sp, mode="follow", extra=extra),
                         unsafe_allow_html=True)
 
-    # --- Validasi A1 (opsional, tarik kredit) ---
+    # --- Validasi silang A1 COT (display-only; TIDAK memengaruhi engine) ---
     st.divider()
-    with st.expander("🔎 Validasi silang dengan A1 COT (opsional — menarik kredit parse.bot)"):
-        pb = _get_pb()
-        has_key = pb is not None and pb._api_key() is not None
-        st.caption("A1 = CFTC Legacy **non-commercial** (kategori beda dari TFF). Untuk **cek arah** saja — "
-                   "TIDAK masuk skor (skor pakai CFTC). Cukup 1× setelah Jumat (cache 24 jam).")
-        if pb is None:
-            st.error("Modul `parsebot_client.py` belum ada di collectors/.")
-        if st.button("Generate A1 COT (validasi)", key="cot_a1_validate", disabled=not has_key):
-            try:
-                with st.spinner("…"):
-                    st.session_state["a1_cot_data"] = pb.parse_a1_cot(
-                        pb.fetch(pb.SCRAPERS["a1edge"], "get_cot_report", {}, ttl=86_400))
-                    st.session_state["a1_cot_ts"] = _now_wib_str()
-            except Exception as exc:
-                st.error(f"A1 COT: {exc}")
-        if pb is not None and not has_key:
-            st.warning("Set `PARSE_API_KEY` di Secrets untuk pakai validasi A1.")
-        a1 = st.session_state.get("a1_cot_data")
-        if a1:
-            st.caption(f"A1 update: {st.session_state.get('a1_cot_ts','-')}")
-            if cftc:
-                agree = total = 0
-                rows = []
-                for ccy in sorted(_FOREX_CCY):
-                    av = a1.get(ccy)
-                    ov = cftc.get(ccy)
-                    if av and ov and ov.get("net") is not None and av.get("net_pct") is not None:
-                        total += 1
-                        same = (av["net_pct"] >= 0) == (ov["net"] >= 0)
-                        agree += 1 if same else 0
-                        rows.append({"CCY": ccy, "CFTC net": f"{ov['net']:+,}",
-                                     "A1 net%": av["net_pct"], "Arah": "✅ sama" if same else "⚠ beda"})
-                if total:
-                    pct = round(100 * agree / total)
-                    verdict = ("→ sinyal sama, mantap pakai CFTC."
-                               if pct >= 80 else "→ ada divergensi, cek event/kategori.")
-                    st.caption(f"🔁 Arah searah: {agree}/{total} ({pct}%) {verdict}")
-                    st.dataframe(rows, use_container_width=True, hide_index=True)
+    st.markdown("#### 🔎 Validasi silang A1 COT")
+    pb = _get_pb()
+    has_key = pb is not None and pb._api_key() is not None
+    st.caption("A1 = CFTC Legacy **non-commercial** (kategori beda dari TFF). **Cek arah** saja — "
+               "TIDAK masuk skor (skor pakai CFTC). Cukup 1× setelah Jumat (cache 24 jam).")
+    if pb is None:
+        st.error("Modul `parsebot_client.py` belum ada di collectors/.")
+    if st.button("Generate A1 COT (validasi)", key="cot_a1_validate", disabled=not has_key):
+        try:
+            with st.spinner("…"):
+                st.session_state["a1_cot_data"] = pb.parse_a1_cot(
+                    pb.fetch(pb.SCRAPERS["a1edge"], "get_cot_report", {}, ttl=86_400))
+                st.session_state["a1_cot_ts"] = _now_wib_str()
+        except Exception as exc:
+            st.error(f"A1 COT: {exc}")
+    if pb is not None and not has_key:
+        st.warning("Set `PARSE_API_KEY` di Secrets untuk pakai validasi A1.")
+
+    a1 = st.session_state.get("a1_cot_data")
+    if not a1:
+        st.info("Belum generate A1 COT. Klik tombol di atas (cache 24 jam, 0 kredit saat klik ulang).")
+        return
+    st.caption(f"A1 update: {st.session_state.get('a1_cot_ts','-')}")
+
+    # Kartu A1 — format sama persis dengan kartu CFTC/retail (mode follow)
+    st.markdown("**Kartu A1 (non-commercial = smart money)**")
+    a1_items = []
+    for asset, v in a1.items():
+        lp = v.get("long_pct")
+        if lp is None:
+            continue
+        if asset in _FOREX_CCY:
+            tag = "FOREX"
+        elif asset in ("Gold", "XAU", "SILVER", "PLATINUM", "COPPER", "USOil", "USOIL"):
+            tag = "KOMODITAS"
+        elif asset in ("BTC", "ETH"):
+            tag = "CRYPTO"
+        else:
+            tag = "INDEX"
+        a1_items.append((asset, tag, lp, v.get("short_pct")))
+    a1_items.sort(key=lambda x: abs((x[2] or 50) - 50), reverse=True)
+    for i, (disp, tag, lp, sp) in enumerate(a1_items, 1):
+        st.markdown(_sentiment_card(i, disp, disp, tag, lp, sp, mode="follow"),
+                    unsafe_allow_html=True)
+
+    # Tabel confidence modulation A1 vs CFTC (display-only)
+    if cftc:
+        agree = total = 0
+        body = ('<div class="qf-cotrow head"><span>CCY</span><span>CFTC net</span>'
+                '<span>A1 net%</span><span>Arah</span><span>Kesimpulan</span></div>')
+        for ccy in sorted(_FOREX_CCY):
+            av = a1.get(ccy)
+            ov = cftc.get(ccy)
+            if not (av and ov and ov.get("net") is not None and av.get("net_pct") is not None):
+                continue
+            total += 1
+            same = (av["net_pct"] >= 0) == (ov["net"] >= 0)
+            agree += 1 if same else 0
+            if same:
+                arah = '<span class="qf-pos">● sama</span>'
+                kes = '<span class="qf-pos" style="font-weight:600;">SEARAH → confidence naik</span>'
+            else:
+                arah = '<span class="qf-neg">▲ beda</span>'
+                kes = '<span class="qf-neg" style="font-weight:600;">BEDA → confidence turun</span>'
+            body += (
+                f'<div class="qf-cotrow"><span class="qf-pair">{ccy}</span>'
+                f'<span class="qf-pnote">{ov["net"]:+,}</span>'
+                f'<span class="qf-pnote">{av["net_pct"]:+.2f}</span>'
+                f'<span style="font-size:0.82rem;">{arah}</span>'
+                f'<span style="font-size:0.8rem;">{kes}</span></div>'
+            )
+        if total:
+            pct = round(100 * agree / total)
+            st.markdown(f"**Confidence modulation A1 ↔ CFTC** — searah **{agree}/{total} ({pct}%)**. "
+                        "_Kolom kesimpulan = arah saja; display/validasi, belum memengaruhi engine._")
+            st.markdown(f'<div class="qf-wrap">{body}</div>', unsafe_allow_html=True)
+        else:
+            st.caption("Tidak ada CCY yang cocok antara A1 & CFTC untuk dibandingkan.")
 
 
 def render_risk_events_ff(calendar_data: dict) -> None:
