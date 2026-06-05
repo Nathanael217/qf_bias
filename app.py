@@ -1,4 +1,4 @@
-# QF_BIAS_BUILD: FF calendar per-day full-week format + Retail/COT separate tabs (card UI, fade vs follow) + COT-vs-CFTC dedup (2026-06-04n)
+# QF_BIAS_BUILD: ENGINE v2 — faktor F (FF surprise z×polarity×impact×freshness) + A1 retail→D + toggle per-faktor + weights rebalanced placeholder (2026-06-04q)
 """
 app.py — QF_BIAS Dashboard (Streamlit)
 ========================================
@@ -1314,8 +1314,9 @@ def render_score_detail(
     rows = []
     factor_names = {"R_hard": "R_hard (makro: rate diff + surprise)",
                     "C": "C (COT positioning)",
-                    "D": "D (retail sentiment, kontrarian)"}
-    for fkey in ["R_hard", "C", "D"]:
+                    "D": "D (retail sentiment, kontrarian)",
+                    "F": "F (ForexFactory surprise: actual vs forecast)"}
+    for fkey in ["R_hard", "C", "D", "F"]:
         info = drivers.get(fkey, {})
         score = info.get("score", 0.0)
         w_eff = info.get("weight", 0.0)
@@ -1633,62 +1634,74 @@ def render_retail_tab() -> None:
 
 
 def render_cot_tab(cot_data: dict | None = None) -> None:
-    """Tab COT (A1, non-commercial = smart money) — kartu per aset, searah (follow)."""
-    pb = _get_pb()
-    st.subheader("🏛️ COT — A1 (non-commercial / smart money)")
-    if pb is None:
-        st.error("Modul `parsebot_client.py` belum ada di repo (collectors/).")
-        return
-    has_key = pb._api_key() is not None
-    st.caption("COT non-commercial = **smart money** → dibaca **searah** (ikut), bukan fade. "
-               "Data MINGGUAN. Display; faktor C di engine pilih satu sumber (lihat catatan dedup).")
-    if st.button("🔄 Tarik / refresh COT", key="cot_tab_fetch", disabled=not has_key):
-        try:
-            with st.spinner("…"):
-                st.session_state["a1_cot_data"] = pb.parse_a1_cot(
-                    pb.fetch(pb.SCRAPERS["a1edge"], "get_cot_report", {}, ttl=21_600))
-                st.session_state["a1_cot_ts"] = _now_wib_str()
-        except Exception as exc:
-            st.error(f"cot: {exc}")
-    if not has_key:
-        st.warning("Set `PARSE_API_KEY` di Secrets dulu.")
-    data = st.session_state.get("a1_cot_data")
-    if not data:
-        st.info("Belum ada data. Klik tombol di atas (atau tarik di tab Data Feeds).")
-        return
-    st.caption(f"Update: {st.session_state.get('a1_cot_ts','-')}")
-    # --- dedup vs CFTC lama (mingguan): kalau arah sama, engine pakai yang lama ---
+    """Tab COT — CFTC (gratis, sumber utama faktor C) + validasi A1 opsional (tarik kredit)."""
+    st.subheader("🏛️ COT — CFTC TFF (gratis)")
+    st.caption("Sumber utama: **CFTC TFF Leveraged Funds — GRATIS, tanpa kredit parse.bot**. "
+               "Non-commercial = smart money → dibaca **searah** (ikut), bukan fade.")
+    st.caption("🗓️ **Mingguan & lagging**: snapshot Selasa, rilis Jumat ~15:30 ET.")
+
     cftc = (cot_data or {}).get("cot", {}) if cot_data else {}
-    if cftc:
-        agree = total = 0
-        for ccy in _FOREX_CCY:
-            a1 = data.get(ccy)
-            old = cftc.get(ccy)
-            if a1 and old and old.get("net") is not None and a1.get("net_pct") is not None:
-                total += 1
-                if (a1["net_pct"] >= 0) == (old["net"] >= 0):
-                    agree += 1
-        if total:
-            pct = round(100 * agree / total)
-            verdict = ("SAMA arah → engine pakai CFTC lama (gratis, jangan double-count)"
-                       if pct >= 80 else "BEDA arah → cek sumber mana yang benar")
-            st.caption(f"🔁 Dedup vs CFTC: {agree}/{total} mata uang searah ({pct}%). {verdict}")
-    # kartu per aset (mata uang + emas + crypto)
-    name_map = {"Gold": ("XAUUSD", "KOMODITAS"), "BTC": ("BTCUSD", "CRYPTO")}
     items = []
-    for asset, v in data.items():
-        lp = v.get("long_pct")
-        if lp is None:
+    for asset, v in cftc.items():
+        if not isinstance(v, dict) or v.get("_error") or v.get("long_pct") is None:
             continue
-        if asset in _FOREX_CCY:
-            items.append((asset, asset, "FOREX (futures)", lp, v.get("short_pct")))
-        elif asset in name_map:
-            disp, tag = name_map[asset]
-            items.append((disp, asset, tag, lp, v.get("short_pct")))
-    items.sort(key=lambda x: abs((x[3] or 50) - 50), reverse=True)
-    for i, (disp, sub, tag, lp, sp) in enumerate(items, 1):
-        st.markdown(_sentiment_card(i, disp, sub, tag, lp, sp, mode="follow"),
-                    unsafe_allow_html=True)
+        tag = ("CRYPTO" if asset in ("BTC", "ETH")
+               else "KOMODITAS" if asset in ("XAU", "Gold", "SILVER") else "FOREX (futures)")
+        extra = ""
+        if v.get("net") is not None:
+            extra += f" · net {v['net']:+,}"
+        if v.get("cot_index") is not None:
+            extra += f" · COT idx {v['cot_index']:.0f}/100"
+        items.append((asset, asset, tag, v["long_pct"], v.get("short_pct"), extra))
+    if not items:
+        st.info("Data COT CFTC belum termuat (cek badge COT di header). XAU/emas tidak ada di TFF "
+                "— pakai validasi A1 di bawah untuk emas.")
+    else:
+        items.sort(key=lambda x: abs((x[3] or 50) - 50), reverse=True)
+        for i, (disp, sub, tag, lp, sp, extra) in enumerate(items, 1):
+            st.markdown(_sentiment_card(i, disp, sub, tag, lp, sp, mode="follow", extra=extra),
+                        unsafe_allow_html=True)
+
+    # --- Validasi A1 (opsional, tarik kredit) ---
+    st.divider()
+    with st.expander("🔎 Validasi silang dengan A1 COT (opsional — menarik kredit parse.bot)"):
+        pb = _get_pb()
+        has_key = pb is not None and pb._api_key() is not None
+        st.caption("A1 = CFTC Legacy **non-commercial** (kategori beda dari TFF). Untuk **cek arah** saja — "
+                   "TIDAK masuk skor (skor pakai CFTC). Cukup 1× setelah Jumat (cache 24 jam).")
+        if pb is None:
+            st.error("Modul `parsebot_client.py` belum ada di collectors/.")
+        if st.button("Generate A1 COT (validasi)", key="cot_a1_validate", disabled=not has_key):
+            try:
+                with st.spinner("…"):
+                    st.session_state["a1_cot_data"] = pb.parse_a1_cot(
+                        pb.fetch(pb.SCRAPERS["a1edge"], "get_cot_report", {}, ttl=86_400))
+                    st.session_state["a1_cot_ts"] = _now_wib_str()
+            except Exception as exc:
+                st.error(f"A1 COT: {exc}")
+        if pb is not None and not has_key:
+            st.warning("Set `PARSE_API_KEY` di Secrets untuk pakai validasi A1.")
+        a1 = st.session_state.get("a1_cot_data")
+        if a1:
+            st.caption(f"A1 update: {st.session_state.get('a1_cot_ts','-')}")
+            if cftc:
+                agree = total = 0
+                rows = []
+                for ccy in sorted(_FOREX_CCY):
+                    av = a1.get(ccy)
+                    ov = cftc.get(ccy)
+                    if av and ov and ov.get("net") is not None and av.get("net_pct") is not None:
+                        total += 1
+                        same = (av["net_pct"] >= 0) == (ov["net"] >= 0)
+                        agree += 1 if same else 0
+                        rows.append({"CCY": ccy, "CFTC net": f"{ov['net']:+,}",
+                                     "A1 net%": av["net_pct"], "Arah": "✅ sama" if same else "⚠ beda"})
+                if total:
+                    pct = round(100 * agree / total)
+                    verdict = ("→ sinyal sama, mantap pakai CFTC."
+                               if pct >= 80 else "→ ada divergensi, cek event/kategori.")
+                    st.caption(f"🔁 Arah searah: {agree}/{total} ({pct}%) {verdict}")
+                    st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 def render_data_feeds() -> None:
@@ -1789,7 +1802,7 @@ def render_data_feeds() -> None:
             try:
                 with st.spinner("…"):
                     st.session_state["a1_cot_data"] = pb.parse_a1_cot(
-                        pb.fetch(a1, "get_cot_report", {}, ttl=21_600))
+                        pb.fetch(a1, "get_cot_report", {}, ttl=86_400))
                     st.session_state["a1_cot_ts"] = _now_wib_str()
             except Exception as exc:
                 st.error(f"cot: {exc}")
@@ -1850,6 +1863,27 @@ def render_data_feeds() -> None:
 def _now_wib_str() -> str:
     from datetime import datetime, timezone, timedelta
     return datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M WIB")
+
+
+def _a1_retail_to_scores(per_ccy: dict) -> dict[str, dict]:
+    """A1 retail per-currency long% → skor D kontrarian [-1,1] (gating ekstrem 70/30)."""
+    EXTREME = 70
+    out: dict[str, dict] = {}
+    for ccy, v in (per_ccy or {}).items():
+        lp = v.get("long_pct") if isinstance(v, dict) else None
+        if lp is None:
+            continue
+        lp = float(lp)
+        if lp >= EXTREME:
+            s = -min(1.0, (lp - EXTREME) / (100 - EXTREME))   # crowd long → fade short
+            tag = "fade→bearish"
+        elif lp <= (100 - EXTREME):
+            s = min(1.0, ((100 - EXTREME) - lp) / (100 - EXTREME))  # crowd short → fade long
+            tag = "fade→bullish"
+        else:
+            s, tag = 0.0, "netral (tak ekstrem)"
+        out[ccy] = {"score": round(s, 4), "detail": f"A1 retail {lp:.0f}% long → {tag}"}
+    return out
 
 
 def main() -> None:
@@ -1935,6 +1969,31 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # STEP 3 — Engine
     # -----------------------------------------------------------------------
+    # Toggle faktor Currency Power (engine v2) — OFF = faktor dianggap netral
+    with st.sidebar:
+        st.markdown("### ⚙️ Faktor Currency Power")
+        st.caption("Matikan faktor yang dirasa kurang akurat → dianggap netral (keluar dari skor).")
+        en_rate = st.checkbox("Rate differential (R_hard)", value=True, key="en_rate")
+        en_cot = st.checkbox("COT — CFTC smart money (C)", value=True, key="en_cot")
+        en_ret = st.checkbox("Retail sentiment — A1 kontrarian (D)", value=True, key="en_ret")
+        en_ff = st.checkbox("FF surprise — actual vs forecast (F)", value=True, key="en_ff")
+    enabled = {f for f, on in [("R_hard", en_rate), ("C", en_cot), ("D", en_ret), ("F", en_ff)] if on}
+
+    # Bangun FF surprise + A1 retail override dari data click-to-run (kalau sudah ditarik)
+    ff_scores: dict[str, dict] = {}
+    retail_override: dict[str, dict] = {}
+    try:
+        from engine.ff_surprise import compute_ff_surprise
+        from datetime import datetime, timezone, timedelta
+        if st.session_state.get("pb_ff_data"):
+            _wib_today = datetime.now(timezone(timedelta(hours=7))).date()
+            ff_scores = compute_ff_surprise(st.session_state["pb_ff_data"], _wib_today)
+    except Exception:
+        ff_scores = {}
+    _a1ret = (st.session_state.get("a1_retail_data") or {}).get("per_currency", {})
+    if _a1ret:
+        retail_override = _a1_retail_to_scores(_a1ret)
+
     with st.spinner("Menghitung bias…"):
         # 3a. Compute all assets (baseline)
         try:
@@ -1943,6 +2002,9 @@ def main() -> None:
                 cot=cot_data,
                 retail=retail_data,
                 prices=prices_data,
+                ff_scores=ff_scores,
+                retail_override=retail_override,
+                enabled=enabled,
             )
         except Exception as exc:
             st.error(f"compute_all_assets() gagal: {exc}")
