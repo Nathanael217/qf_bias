@@ -19,7 +19,6 @@ BOBOT: semua PLACEHOLDER. Renormalisasi otomatis atas faktor yang score-nya ≠ 
 from __future__ import annotations
 
 import logging
-import math
 from typing import Any
 
 from config import (
@@ -34,39 +33,23 @@ from config import (
     bias_label,
 )
 from engine.freshness import cot_freshness
-from utils.timeutils import age_minutes
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Blend constants untuk score_R_hard — PLACEHOLDER
+# R_hard = CARRY MURNI (rate differential). PLACEHOLDER.
 # ---------------------------------------------------------------------------
-_RHARD_Z_WEIGHT: float = 0.60
+# FIX DOUBLE-COUNT (2026-06-05): komponen surprise z-score DIHAPUS dari R_hard.
+# Surprise rilis ekonomi sekarang HANYA hidup di faktor F (engine/ff_surprise),
+# di-feed otomatis dari kalender faireconomy. Sebelumnya rilis yang SAMA men-drive
+# R_hard (z, internal 0.60) DAN F (0.20) → double-count lintas-faktor. R_hard kini
+# murni mengukur carry (selisih suku bunga kebijakan).
+_RHARD_CARRY_SCALE: float = 0.40
 """
-Bobot surprise z-score dalam blend R_hard internal.
-⚠ PLACEHOLDER — z-score lebih kausal (data aktual vs ekspektasi) daripada rate diff statis.
-"""
-
-_RHARD_DIFF_WEIGHT: float = 0.40
-"""
-Bobot rate differential dalam blend R_hard internal.
-⚠ PLACEHOLDER.
-"""
-
-_RHARD_Z_CLAMP: float = 3.0
-"""
-Clamp z-score sebelum normalisasi ke [-1,1].
-z di luar [-3,3] diperlakukan sebagai kejutan ekstrem maksimum.
-⚠ PLACEHOLDER.
-"""
-
-_SURPRISE_DECAY_DAYS: float = 2.0
-"""
-Konstanta peluruhan bobot surprise terhadap UMUR event (hari).
-decay = exp(-age_hari / _SURPRISE_DECAY_DAYS).
-  age 0h → 1.00 | 1 hari → 0.61 | 2 hari → 0.37 | 3 hari → 0.22
-Inilah yang membuat "besok/lusa/3 hari" bobotnya berbeda.
-⚠ PLACEHOLDER — kalibrasi dari seberapa cepat efek surprise hilang dari harga (backtest).
+Skala kontribusi carry ke R_hard. Sengaja = bobot diff lama (0.40) agar magnitude
+R_hard standalone TIDAK berubah dari versi pra-fix (mis. EUR carry-only tetap ≈ -18,
+bukan melonjak ke -46). Carry dijaga moderat: sinyal lambat, tak boleh teriak
+sendirian. ⚠ PLACEHOLDER — backtest bisa membenarkan range penuh.
 """
 
 _RHARD_DIFF_MAX: float = 5.0
@@ -117,25 +100,19 @@ def _clamp(value: float, lo: float, hi: float) -> float:
 # ---------------------------------------------------------------------------
 
 def score_R_hard(macro: dict[str, Any], asset: str) -> tuple[float, str]:
-    """Hitung sub-skor R_hard untuk satu asset/currency.
+    """Hitung sub-skor R_hard (CARRY) untuk satu asset/currency.
 
-    Blend dua sinyal:
-      (a) Surprise z-score: z-score rilis ekonomi terbaru currency ini.
-          z positif = data lebih kuat dari ekspektasi = bullish bias.
-          Sumber: macro["surprises"][asset] → list event, ambil event terbaru.
-          Di-clamp ke [-Z_CLAMP, Z_CLAMP] lalu dinormalisasi ke [-1, 1].
-      (b) Rate differential: dari macro["rate_diff"].
-          Lookup pair "ASSETxxx" di mana asset = base → positif berarti yield asset ini
-          lebih tinggi dari counterpart → bullish carry bias.
-          Untuk USD sebagai quote (EURUSD, dst): rate diff EURUSD berarti EUR−USD,
-          jadi untuk USD kita negate semua rate_diff di mana USD = quote.
-          Di-clamp ke [-DIFF_MAX, DIFF_MAX] lalu dinormalisasi.
+    R_hard = rate differential murni (selisih suku bunga kebijakan).
+      Dari macro["rate_diff"]. Lookup pair di mana asset = base → positif berarti
+      yield asset ini lebih tinggi → bullish carry. Untuk asset = quote (mis. USD
+      di EURUSD) diff dinegate ke perspektif asset. Multi-pair (USD/EUR) dirata.
+      Di-clamp ke [-DIFF_MAX, DIFF_MAX], dinormalisasi, lalu ×_RHARD_CARRY_SCALE.
 
-    Blend: R_hard = _RHARD_Z_WEIGHT × z_norm + _RHARD_DIFF_WEIGHT × diff_norm
-           → clamp ke [-1, 1].
+    FIX DOUBLE-COUNT: komponen surprise z-score DIHAPUS dari R_hard. Surprise kini
+    hidup HANYA di faktor F (engine/ff_surprise). Dulu rilis yang sama men-drive
+    R_hard (z) DAN F sekaligus → satu kejutan ekonomi dihitung dua kali.
 
-    Kalau data tidak tersedia untuk salah satu sinyal → sinyal itu = 0
-    (kontribusi berkurang, bukan crash).
+    Kalau rate_diff tak tersedia → score = 0 (kontribusi berkurang, bukan crash).
 
     Parameters
     ----------
@@ -149,45 +126,7 @@ def score_R_hard(macro: dict[str, Any], asset: str) -> tuple[float, str]:
     (score, detail_str)
         score ∈ [-1, 1], detail_str untuk display di dashboard.
     """
-    # --- (a) Surprise z-score ---
-    z_norm = 0.0
-    z_detail = "no surprise data"
-
-    surprises: list[dict] = _safe_get(macro, "surprises", asset, default=[])
-    if surprises:
-        # Ambil event paling baru BY ts_utc; bila beberapa rilis di timestamp SAMA
-        # (mis. hari NFP: NFP+Unemployment+AHE; atau HICP headline+core), pilih |z|
-        # TERBESAR (surprise paling material) — bukan posisi-list arbitrer. Ini tie-break,
-        # BUKAN agregasi: tetap satu surprise. Agregasi multi-surprise (jumlah/decay/impact-
-        # weighted) = keputusan pembobotan → ranah backtest, sengaja belum dibuat.
-        scored_evts = [e for e in surprises if e.get("z") is not None]
-        latest = None
-        if scored_evts:
-            latest_ts = max((e.get("ts_utc") or "") for e in scored_evts)
-            same_ts = [e for e in scored_evts if (e.get("ts_utc") or "") == latest_ts]
-            latest = max(same_ts, key=lambda e: abs(float(e["z"])))
-        if latest and latest.get("z") is not None:
-            z_raw = float(latest["z"])
-            z_clamped = _clamp(z_raw, -_RHARD_Z_CLAMP, _RHARD_Z_CLAMP)
-            z_norm = z_clamped / _RHARD_Z_CLAMP
-            # Time-decay: bobot surprise melemah seiring umur event
-            # (besok/lusa/3 hari berbeda). decay = exp(-age_hari/_SURPRISE_DECAY_DAYS).
-            decay = 1.0
-            ts = latest.get("ts_utc")
-            if ts:
-                try:
-                    age_days = max(0.0, age_minutes(ts) / 1440.0)
-                    decay = math.exp(-age_days / _SURPRISE_DECAY_DAYS)
-                except Exception:
-                    decay = 1.0
-            z_norm *= decay
-            z_detail = f"{latest.get('event','?')} z={z_raw:.2f} ×decay{decay:.2f}"
-        else:
-            z_detail = "surprises ada tapi z=None"
-    else:
-        logger.debug("score_R_hard[%s]: tidak ada surprise data", asset)
-
-    # --- (b) Rate differential ---
+    # --- Rate differential (carry) — satu-satunya komponen R_hard ---
     diff_norm = 0.0
     diff_detail = "no rate diff data"
 
@@ -223,14 +162,11 @@ def score_R_hard(macro: dict[str, Any], asset: str) -> tuple[float, str]:
     else:
         logger.debug("score_R_hard[%s]: tidak ada rate_diff data", asset)
 
-    # --- Blend ---
-    score = _clamp(
-        _RHARD_Z_WEIGHT * z_norm + _RHARD_DIFF_WEIGHT * diff_norm,
-        -1.0, 1.0,
-    )
+    # --- Skor carry ---
+    score = _clamp(_RHARD_CARRY_SCALE * diff_norm, -1.0, 1.0)
 
-    detail = f"{z_detail}; {diff_detail} → R_hard={score:.3f}"
-    logger.debug("score_R_hard[%s]: z_norm=%.3f, diff_norm=%.3f → %.3f", asset, z_norm, diff_norm, score)
+    detail = f"{diff_detail} → R_hard(carry)={score:.3f}"
+    logger.debug("score_R_hard[%s]: diff_norm=%.3f → %.3f", asset, diff_norm, score)
     return score, detail
 
 
