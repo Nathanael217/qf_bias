@@ -2229,14 +2229,13 @@ def main() -> None:
         # Calendar dulu — diperlukan oleh macro untuk surprises
         calendar_data = cached_get_calendar()
 
-        # SURPRISE ENRICHMENT (lean Modul A — koreksi premis handover):
-        #   `actual` BUKAN yang hilang — calendar_evt sudah mem-parse actual dari feed
-        #   faireconomy. Yang hilang adalah σ (historical_std). engine/sigma_table.py
-        #   mengisi historical_std + surprise_polarity + actual_source untuk indikator
-        #   high-impact yang dikenal. Karena actual+forecast dua-duanya dari feed yang
-        #   SAMA, unit konsisten otomatis (tak ada unit-matching landmine).
+        # SURPRISE ENRICHMENT (Modul A):
+        #   faireconomy TIDAK mengirim `actual` (hanya forecast/previous). Actual masuk
+        #   dari: Eurostat (EUR/HICP), manual/Groq-vision (di bawah), dan untuk faktor F
+        #   dari scrape ForexFactory. engine/sigma_table.py mengisi historical_std +
+        #   surprise_polarity untuk indikator high-impact yang dikenal (σ = SEED
+        #   PLACEHOLDER → ganti dgn σ terukur dari histori + backtest).
         #   Keanggotaan tabel = gate scoring; indikator tak dikenal tetap display-only.
-        #   σ = SEED PLACEHOLDER → ganti dgn σ terukur dari histori + backtest.
         import json
 
         # MODUL A #1 — Actual real-time via API resmi Eurostat (EUR/HICP).
@@ -2289,16 +2288,28 @@ def main() -> None:
             help="bias_score = baseline + news_delta (cap ±30). Off = baseline murni.")
     enabled = {f for f, on in [("R_hard", en_rate), ("C", en_cot), ("D", en_ret), ("F", en_ff)] if on}
 
-    # Bangun FF surprise + A1 retail override dari data click-to-run (kalau sudah ditarik)
+    # Faktor F (surprise). FIX double-count: surprise tidak lagi di R_hard (kini carry murni).
+    # PRIORITAS SUMBER ACTUAL:
+    #   PRIMARY  = scrape ForexFactory (pb_ff_data) — faireconomy TIDAK mengirim actual
+    #              (hanya forecast/previous), makanya FF di-scrape untuk dapat actual.
+    #   FALLBACK = actual dari kalender (Eurostat EUR / manual / Groq vision) yang sudah
+    #              masuk released_events — dipakai HANYA bila FF belum di-scrape.
+    # Either/or (bukan gabung) → tak ada double-count antar dua sumber di dalam F.
     ff_scores: dict[str, dict] = {}
     retail_override: dict[str, dict] = {}
     try:
-        from engine.ff_surprise import compute_ff_surprise
-        from datetime import datetime, timezone, timedelta
+        from engine.ff_surprise import (
+            compute_ff_surprise,
+            compute_ff_surprise_from_calendar,
+        )
         if st.session_state.get("pb_ff_data"):
+            from datetime import datetime, timezone, timedelta
             _wib_now = datetime.now(timezone(timedelta(hours=7)))
             ff_scores = compute_ff_surprise(st.session_state["pb_ff_data"], _wib_now)
-    except Exception:
+        if not ff_scores:
+            ff_scores = compute_ff_surprise_from_calendar(released_events)
+    except Exception as _ff_exc:
+        logger.warning("ff_scores build gagal: %s", _ff_exc)
         ff_scores = {}
     _a1ret = (st.session_state.get("a1_retail_data") or {}).get("per_currency", {})
     if _a1ret:
